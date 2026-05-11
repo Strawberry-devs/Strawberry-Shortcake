@@ -36,6 +36,9 @@
 
 #include <imgui.h>
 #include <reshade.hpp>
+#include <d3dcompiler.h>
+#include <d3d11shader.h>
+#include <wrl/client.h>
 #include "crc32_hash.hpp"
 #include "ShaderManager.h"
 #include "CDataFile.h"
@@ -50,6 +53,9 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <array>
+
+#pragma comment(lib, "d3dcompiler.lib")
 
 using namespace reshade::api;
 using namespace Shortcake;
@@ -58,12 +64,16 @@ extern "C" __declspec(dllexport) const char *NAME = "Strawberry Shortcake";
 extern "C" __declspec(dllexport) const char *DESCRIPTION = "Add-on which allows you to define groups of game shaders to toggle on/off with one key press.";
 
 static constexpr uint32_t MAX_PS_SRV_SLOTS = 128;
+static constexpr uint32_t MAX_PS_CB_SLOTS = 32;
 
 struct __declspec(uuid("038B03AA-4C75-443B-A695-752D80797037")) CommandListDataContainer {
     uint64_t activePixelShaderPipeline;
     uint64_t activeVertexShaderPipeline;
 	uint64_t activeComputeShaderPipeline;
     resource_view pixelSRVs[MAX_PS_SRV_SLOTS]; // current SRVs bound to the pixel-shader stage
+    buffer_range pixelCBs[MAX_PS_CB_SLOTS]; // current constant buffers bound to the pixel-shader stage
+    pipeline_layout pixelCBLayouts[MAX_PS_CB_SLOTS];
+    uint32_t pixelCBLayoutParams[MAX_PS_CB_SLOTS];
 };
 
 #define FRAMECOUNT_COLLECTION_PHASE_DEFAULT 250;
@@ -97,6 +107,56 @@ static std::vector<resource_view> g_lastHuntedPixelSRVs;
 static std::vector<std::string>   g_exportResultLines;
 static bool                       g_showExportResult = false;
 
+// Pixel-shader constant-buffer editor state
+struct ShaderVariableInfo
+{
+	std::string cbufferName;
+	std::string name;
+	uint32_t bindPoint = 0;
+	uint32_t offset = 0;
+	uint32_t size = 0;
+	uint32_t rows = 0;
+	uint32_t columns = 0;
+	D3D_SHADER_VARIABLE_CLASS varClass = D3D_SVC_SCALAR;
+	D3D_SHADER_VARIABLE_TYPE varType = D3D_SVT_FLOAT;
+};
+
+struct ShaderReflectionInfo
+{
+	std::vector<ShaderVariableInfo> variables;
+};
+
+struct ConstantBufferSnapshot
+{
+	buffer_range range = {};
+	std::vector<uint8_t> bytes;
+};
+
+struct ConstantBufferOverride
+{
+	resource original = { 0 };
+	resource replacement = { 0 };
+	uint64_t sourceOffset = 0;
+	std::vector<uint8_t> bytes;
+};
+
+struct MappedConstantBuffer
+{
+	resource buffer = { 0 };
+	uint64_t offset = 0;
+	uint64_t size = 0;
+	void* data = nullptr;
+};
+
+static std::unordered_map<uint32_t, ShaderReflectionInfo> g_pixelShaderReflection;
+static std::unordered_map<uint64_t, std::vector<uint8_t>> g_bufferSnapshots;
+static std::array<ConstantBufferSnapshot, MAX_PS_CB_SLOTS> g_lastHuntedPixelCBs;
+static bool g_showPixelShaderVariableEditor = false;
+static uint32_t g_variableEditorShaderHash = 0;
+static std::array<ConstantBufferOverride, MAX_PS_CB_SLOTS> g_pixelCBOverrides;
+static std::unordered_map<uint64_t, MappedConstantBuffer> g_mappedConstantBuffers;
+static std::mutex g_constantBufferMutex;
+
 // Texture-override state
 struct OverrideEntry { resource tex = {0}; resource_view srv = {0}; };
 static std::mutex                                  g_overrideMutex;
@@ -104,6 +164,7 @@ static std::unordered_map<std::string, uint64_t>   g_texHashToResource;  // cont
 static std::unordered_map<uint64_t, OverrideEntry> g_textureOverrides;   // resource handle -> GPU override
 static device*                                     g_device = nullptr;
 static thread_local bool                           t_inOverridePush = false;
+static thread_local bool                           t_inConstantBufferOverridePush = false;
 
 /// <summary>
 /// Calculates a crc32 hash from the passed in shader bytecode. The hash is used to identity the shader in future runs.
@@ -119,6 +180,158 @@ static uint32_t calculateShaderHash(void* shaderData)
 
 	const auto shaderDesc = *static_cast<shader_desc *>(shaderData);
 	return compute_crc32(static_cast<const uint8_t *>(shaderDesc.code), shaderDesc.code_size);
+}
+
+static ShaderReflectionInfo reflectPixelShaderVariables(const shader_desc& shaderDesc)
+{
+	ShaderReflectionInfo result;
+	Microsoft::WRL::ComPtr<ID3D11ShaderReflection> reflection;
+	if (FAILED(D3DReflect(shaderDesc.code, shaderDesc.code_size, IID_PPV_ARGS(&reflection))))
+		return result;
+
+	D3D11_SHADER_DESC desc = {};
+	if (FAILED(reflection->GetDesc(&desc)))
+		return result;
+
+	for (UINT cb = 0; cb < desc.ConstantBuffers; ++cb)
+	{
+		ID3D11ShaderReflectionConstantBuffer* cbuffer = reflection->GetConstantBufferByIndex(cb);
+		D3D11_SHADER_BUFFER_DESC cbDesc = {};
+		if (!cbuffer || FAILED(cbuffer->GetDesc(&cbDesc)) || cbDesc.Type != D3D_CT_CBUFFER)
+			continue;
+
+		D3D11_SHADER_INPUT_BIND_DESC bindDesc = {};
+		if (FAILED(reflection->GetResourceBindingDescByName(cbDesc.Name, &bindDesc)))
+			continue;
+
+		for (UINT v = 0; v < cbDesc.Variables; ++v)
+		{
+			ID3D11ShaderReflectionVariable* variable = cbuffer->GetVariableByIndex(v);
+			D3D11_SHADER_VARIABLE_DESC varDesc = {};
+			if (!variable || FAILED(variable->GetDesc(&varDesc)) || (varDesc.uFlags & D3D_SVF_USED) == 0)
+				continue;
+
+			D3D11_SHADER_TYPE_DESC typeDesc = {};
+			if (ID3D11ShaderReflectionType* type = variable->GetType())
+				type->GetDesc(&typeDesc);
+
+			ShaderVariableInfo info;
+			info.cbufferName = cbDesc.Name ? cbDesc.Name : "";
+			info.name = varDesc.Name ? varDesc.Name : "";
+			info.bindPoint = bindDesc.BindPoint;
+			info.offset = varDesc.StartOffset;
+			info.size = varDesc.Size;
+			info.rows = typeDesc.Rows;
+			info.columns = typeDesc.Columns;
+			info.varClass = typeDesc.Class;
+			info.varType = typeDesc.Type;
+			result.variables.push_back(std::move(info));
+		}
+	}
+
+	std::sort(result.variables.begin(), result.variables.end(), [](const ShaderVariableInfo& a, const ShaderVariableInfo& b)
+	{
+		if (a.bindPoint != b.bindPoint) return a.bindPoint < b.bindPoint;
+		return a.offset < b.offset;
+	});
+	return result;
+}
+
+static uint64_t getBufferRangeSize(device* dev, const buffer_range& range)
+{
+	if (!dev || !range.buffer.handle)
+		return 0;
+
+	const resource_desc desc = dev->get_resource_desc(range.buffer);
+	if (desc.type != resource_type::buffer || desc.buffer.size <= range.offset)
+		return 0;
+
+	return range.size == UINT64_MAX ? (desc.buffer.size - range.offset) : std::min<uint64_t>(range.size, desc.buffer.size - range.offset);
+}
+
+static bool readConstantBufferBytes(device* dev, const buffer_range& range, std::vector<uint8_t>& outBytes)
+{
+	const uint64_t size = getBufferRangeSize(dev, range);
+	if (size == 0 || size > 1024 * 1024)
+		return false;
+
+	outBytes.assign(static_cast<size_t>(size), 0);
+	{
+		std::lock_guard<std::mutex> lock(g_constantBufferMutex);
+		const auto it = g_bufferSnapshots.find(range.buffer.handle);
+		if (it != g_bufferSnapshots.end() && it->second.size() >= range.offset + size)
+		{
+			memcpy(outBytes.data(), it->second.data() + range.offset, static_cast<size_t>(size));
+			return true;
+		}
+	}
+
+	void* mapped = nullptr;
+	if (dev->map_buffer_region(range.buffer, range.offset, size, map_access::read_only, &mapped) && mapped)
+	{
+		memcpy(outBytes.data(), mapped, static_cast<size_t>(size));
+		dev->unmap_buffer_region(range.buffer);
+		return true;
+	}
+	return false;
+}
+
+static void destroyPixelConstantBufferOverrides(device* dev)
+{
+	if (!dev)
+		return;
+
+	std::lock_guard<std::mutex> lock(g_constantBufferMutex);
+	for (ConstantBufferOverride& ov : g_pixelCBOverrides)
+	{
+		if (ov.replacement.handle)
+			dev->destroy_resource(ov.replacement);
+		ov = {};
+	}
+}
+
+static void seedPixelShaderVariableEditor(effect_runtime* runtime)
+{
+	if (!runtime || !g_pixelShaderManager.isInHuntingMode() || g_activeCollectorFrameCounter > 0)
+		return;
+
+	device* dev = runtime->get_command_queue()->get_device();
+	const uint32_t shaderHash = g_pixelShaderManager.getActiveHuntedShaderHash();
+	if (!dev || shaderHash == 0)
+		return;
+
+	destroyPixelConstantBufferOverrides(dev);
+	g_variableEditorShaderHash = shaderHash;
+	g_showPixelShaderVariableEditor = true;
+
+	for (uint32_t slot = 0; slot < MAX_PS_CB_SLOTS; ++slot)
+	{
+		const ConstantBufferSnapshot& snap = g_lastHuntedPixelCBs[slot];
+		if (!snap.range.buffer.handle || snap.bytes.empty())
+			continue;
+
+		resource replacement = { 0 };
+		subresource_data initial = {};
+		initial.data = const_cast<uint8_t*>(snap.bytes.data());
+		const resource_desc desc(static_cast<uint64_t>(snap.bytes.size()), memory_heap::gpu_only, resource_usage::constant_buffer);
+		if (!dev->create_resource(desc, &initial, resource_usage::constant_buffer, &replacement))
+			continue;
+
+		g_pixelCBOverrides[slot].original = snap.range.buffer;
+		g_pixelCBOverrides[slot].replacement = replacement;
+		g_pixelCBOverrides[slot].sourceOffset = snap.range.offset;
+		g_pixelCBOverrides[slot].bytes = snap.bytes;
+	}
+}
+
+static void uploadConstantBufferOverride(device* dev, uint32_t slot)
+{
+	if (!dev || slot >= MAX_PS_CB_SLOTS)
+		return;
+
+	ConstantBufferOverride& ov = g_pixelCBOverrides[slot];
+	if (ov.replacement.handle && !ov.bytes.empty())
+		dev->update_buffer_region(ov.bytes.data(), ov.replacement, 0, ov.bytes.size());
 }
 
 
@@ -200,10 +413,12 @@ void saveShortcakeIniFile()
 	iniFile.Save();
 }
 
+static void onResetCommandList(command_list *commandList);
 
 static void onInitCommandList(command_list *commandList)
 {
 	commandList->create_private_data<CommandListDataContainer>();
+	onResetCommandList(commandList);
 }
 
 
@@ -219,6 +434,9 @@ static void onResetCommandList(command_list *commandList)
 	commandListData.activeVertexShaderPipeline = -1;
 	commandListData.activeComputeShaderPipeline = -1;
 	memset(commandListData.pixelSRVs, 0, sizeof(commandListData.pixelSRVs));
+	memset(commandListData.pixelCBs, 0, sizeof(commandListData.pixelCBs));
+	memset(commandListData.pixelCBLayouts, 0, sizeof(commandListData.pixelCBLayouts));
+	memset(commandListData.pixelCBLayoutParams, 0, sizeof(commandListData.pixelCBLayoutParams));
 }
 
 
@@ -233,7 +451,15 @@ static void onInitPipeline(device *device, pipeline_layout, uint32_t subobjectCo
 				g_vertexShaderManager.addHashHandlePair(calculateShaderHash(subobjects[i].data), pipelineHandle.handle);
 				break;
 			case pipeline_subobject_type::pixel_shader:
-				g_pixelShaderManager.addHashHandlePair(calculateShaderHash(subobjects[i].data), pipelineHandle.handle);
+				{
+					const uint32_t hash = calculateShaderHash(subobjects[i].data);
+					g_pixelShaderManager.addHashHandlePair(hash, pipelineHandle.handle);
+					if (hash != 0 && subobjects[i].data)
+					{
+						const auto shaderDesc = *static_cast<shader_desc *>(subobjects[i].data);
+						g_pixelShaderReflection[hash] = reflectPixelShaderVariables(shaderDesc);
+					}
+				}
 				break;
 			case pipeline_subobject_type::compute_shader:
 				g_computeShaderManager.addHashHandlePair(calculateShaderHash(subobjects[i].data), pipelineHandle.handle);
@@ -1318,8 +1544,67 @@ static void onPushDescriptors(command_list* cmdList, shader_stage stages, pipeli
                                const descriptor_set_update& update)
 {
 	if ((stages & shader_stage::pixel) != shader_stage::pixel) return;
-	if (update.type != descriptor_type::shader_resource_view) return;
 	if (update.count == 0 || !update.descriptors) return;
+
+	if (update.type == descriptor_type::constant_buffer)
+	{
+		if (t_inConstantBufferOverridePush)
+			return;
+
+		const buffer_range* ranges = static_cast<const buffer_range*>(update.descriptors);
+		auto& data = cmdList->get_private_data<CommandListDataContainer>();
+		for (uint32_t i = 0; i < update.count; ++i)
+		{
+			const uint32_t slot = update.binding + i;
+			if (slot < MAX_PS_CB_SLOTS)
+			{
+				data.pixelCBs[slot] = ranges[i];
+				data.pixelCBLayouts[slot] = layout;
+				data.pixelCBLayoutParams[slot] = paramIdx;
+			}
+		}
+
+		if (!g_showPixelShaderVariableEditor || !g_device || g_variableEditorShaderHash == 0)
+			return;
+
+		const uint32_t current = g_pixelShaderManager.getShaderHash(data.activePixelShaderPipeline);
+		if (current != g_variableEditorShaderHash)
+			return;
+
+		bool hasOverride = false;
+		std::vector<buffer_range> replaced(update.count);
+		{
+			std::lock_guard<std::mutex> lock(g_constantBufferMutex);
+			for (uint32_t i = 0; i < update.count; ++i)
+			{
+				replaced[i] = ranges[i];
+				const uint32_t slot = update.binding + i;
+				if (slot >= MAX_PS_CB_SLOTS)
+					continue;
+
+				const ConstantBufferOverride& ov = g_pixelCBOverrides[slot];
+				if (ov.replacement.handle && ranges[i].buffer.handle == ov.original.handle)
+				{
+					replaced[i].buffer = ov.replacement;
+					replaced[i].offset = 0;
+					replaced[i].size = ov.bytes.size();
+					hasOverride = true;
+				}
+			}
+		}
+
+		if (hasOverride)
+		{
+			descriptor_set_update newUpdate = update;
+			newUpdate.descriptors = replaced.data();
+			t_inConstantBufferOverridePush = true;
+			cmdList->push_descriptors(stages, layout, paramIdx, newUpdate);
+			t_inConstantBufferOverridePush = false;
+		}
+		return;
+	}
+
+	if (update.type != descriptor_type::shader_resource_view) return;
 
 	const resource_view* views = static_cast<const resource_view*>(update.descriptors);
 
@@ -1377,6 +1662,17 @@ static void onInitResource(device* dev, const resource_desc& desc,
                             resource res)
 {
 	if (!g_device) g_device = dev;
+	if (desc.type == resource_type::buffer)
+	{
+		if ((desc.usage & resource_usage::constant_buffer) == resource_usage::constant_buffer && initial_data && initial_data[0].data && desc.buffer.size > 0 && desc.buffer.size <= 1024 * 1024)
+		{
+			std::lock_guard<std::mutex> lock(g_constantBufferMutex);
+			std::vector<uint8_t>& bytes = g_bufferSnapshots[res.handle];
+			bytes.resize(static_cast<size_t>(desc.buffer.size));
+			memcpy(bytes.data(), initial_data[0].data, bytes.size());
+		}
+		return;
+	}
 	if (desc.type != resource_type::texture_2d) return;
 	if (!initial_data || !initial_data[0].data) return;
 	if (desc.texture.samples > 1) return;
@@ -1406,6 +1702,72 @@ static void onDestroyResource(device* dev, resource res)
 
 	for (auto it = g_texHashToResource.begin(); it != g_texHashToResource.end(); )
 		it = (it->second == res.handle) ? g_texHashToResource.erase(it) : std::next(it);
+
+	g_bufferSnapshots.erase(res.handle);
+	g_mappedConstantBuffers.erase(res.handle);
+}
+
+static bool onUpdateBufferRegion(device* dev, const void* data, resource res, uint64_t offset, uint64_t size)
+{
+	if (!g_device) g_device = dev;
+	if (!data || !res.handle || size == 0 || size > 1024 * 1024)
+		return false;
+
+	const resource_desc desc = dev->get_resource_desc(res);
+	if (desc.type != resource_type::buffer || (desc.usage & resource_usage::constant_buffer) != resource_usage::constant_buffer)
+		return false;
+
+	std::lock_guard<std::mutex> lock(g_constantBufferMutex);
+	std::vector<uint8_t>& bytes = g_bufferSnapshots[res.handle];
+	const uint64_t needed = offset + size;
+	if (bytes.size() < needed)
+		bytes.resize(static_cast<size_t>(needed), 0);
+	memcpy(bytes.data() + offset, data, static_cast<size_t>(size));
+	return false;
+}
+
+static void onMapBufferRegion(device* dev, resource res, uint64_t offset, uint64_t size, map_access access, void** data)
+{
+	if (!g_device) g_device = dev;
+	if (!data || !*data || !res.handle)
+		return;
+	if (access != map_access::write_only && access != map_access::write_discard && access != map_access::read_write)
+		return;
+
+	const resource_desc desc = dev->get_resource_desc(res);
+	if (desc.type != resource_type::buffer || (desc.usage & resource_usage::constant_buffer) != resource_usage::constant_buffer)
+		return;
+	if (desc.buffer.size <= offset)
+		return;
+
+	const uint64_t resolvedSize = size == UINT64_MAX ? (desc.buffer.size - offset) : std::min<uint64_t>(size, desc.buffer.size - offset);
+	if (resolvedSize == 0 || resolvedSize > 1024 * 1024)
+		return;
+
+	std::lock_guard<std::mutex> lock(g_constantBufferMutex);
+	g_mappedConstantBuffers[res.handle] = { res, offset, resolvedSize, *data };
+}
+
+static void onUnmapBufferRegion(device*, resource res)
+{
+	if (!res.handle)
+		return;
+
+	std::lock_guard<std::mutex> lock(g_constantBufferMutex);
+	const auto mappedIt = g_mappedConstantBuffers.find(res.handle);
+	if (mappedIt == g_mappedConstantBuffers.end())
+		return;
+
+	const MappedConstantBuffer mapped = mappedIt->second;
+	if (mapped.data && mapped.size > 0)
+	{
+		std::vector<uint8_t>& bytes = g_bufferSnapshots[res.handle];
+		const uint64_t needed = mapped.offset + mapped.size;
+		if (bytes.size() < needed)
+			bytes.resize(static_cast<size_t>(needed), 0);
+		memcpy(bytes.data() + mapped.offset, mapped.data, static_cast<size_t>(mapped.size));
+	}
+	g_mappedConstantBuffers.erase(mappedIt);
 }
 
 // If the draw call is using the currently hunted pixel shader, snapshot its SRVs.
@@ -1423,10 +1785,150 @@ static void captureHuntedShaderSRVs(command_list* commandList)
 	for (uint32_t i = 0; i < MAX_PS_SRV_SLOTS; ++i)
 		if (data.pixelSRVs[i].handle)
 			g_lastHuntedPixelSRVs.push_back(data.pixelSRVs[i]);
+
+	device* dev = g_device;
+	if (!dev)
+		return;
+
+	for (uint32_t i = 0; i < MAX_PS_CB_SLOTS; ++i)
+	{
+		if (!data.pixelCBs[i].buffer.handle)
+			continue;
+
+		std::vector<uint8_t> bytes;
+		if (readConstantBufferBytes(dev, data.pixelCBs[i], bytes))
+		{
+			g_lastHuntedPixelCBs[i].range = data.pixelCBs[i];
+			g_lastHuntedPixelCBs[i].bytes = std::move(bytes);
+		}
+	}
+}
+
+static void displayPixelShaderVariableEditor(effect_runtime* runtime)
+{
+	if (!g_showPixelShaderVariableEditor)
+		return;
+
+	device* dev = runtime ? runtime->get_command_queue()->get_device() : g_device;
+	ImGui::SetNextWindowBgAlpha(0.95f);
+	ImGui::SetNextWindowPos(ImVec2(10, 120), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSize(ImVec2(560, 460), ImGuiCond_FirstUseEver);
+	if (!ImGui::Begin("Pixel Shader Variables", &g_showPixelShaderVariableEditor, ImGuiWindowFlags_NoSavedSettings))
+	{
+		ImGui::End();
+		return;
+	}
+
+	ImGui::Text("Pixel shader: 0x%08X", g_variableEditorShaderHash);
+	ImGui::SameLine();
+	if (ImGui::Button("Refresh from current shader"))
+		seedPixelShaderVariableEditor(runtime);
+	ImGui::SameLine();
+	if (ImGui::Button("Reset edits"))
+	{
+		destroyPixelConstantBufferOverrides(dev);
+		seedPixelShaderVariableEditor(runtime);
+	}
+	ImGui::Separator();
+
+	const auto reflectionIt = g_pixelShaderReflection.find(g_variableEditorShaderHash);
+	if (reflectionIt == g_pixelShaderReflection.end() || reflectionIt->second.variables.empty())
+	{
+		ImGui::TextUnformatted("No reflected constant-buffer variables were found for this pixel shader.");
+		ImGui::End();
+		return;
+	}
+
+	bool anyCaptured = false;
+	for (const ConstantBufferOverride& ov : g_pixelCBOverrides)
+		anyCaptured |= ov.replacement.handle != 0 && !ov.bytes.empty();
+	if (!anyCaptured)
+	{
+		ImGui::TextUnformatted("No constant-buffer data captured yet. Let the selected shader draw once, then press Refresh.");
+		ImGui::End();
+		return;
+	}
+
+	std::string currentBuffer;
+	for (const ShaderVariableInfo& var : reflectionIt->second.variables)
+	{
+		if (var.bindPoint >= MAX_PS_CB_SLOTS)
+			continue;
+
+		ConstantBufferOverride& ov = g_pixelCBOverrides[var.bindPoint];
+		if (!ov.replacement.handle || ov.bytes.empty() || var.offset >= ov.bytes.size())
+			continue;
+
+		if (currentBuffer != var.cbufferName)
+		{
+			currentBuffer = var.cbufferName;
+			ImGui::Separator();
+			ImGui::Text("b%u  %s", var.bindPoint, currentBuffer.c_str());
+		}
+
+		const uint32_t available = static_cast<uint32_t>(ov.bytes.size() - var.offset);
+		const uint32_t byteCount = std::min<uint32_t>(var.size, available);
+		if (byteCount < sizeof(float))
+			continue;
+
+		ImGui::PushID((int)(var.bindPoint * 4096 + var.offset));
+		bool changed = false;
+		const uint32_t componentCount = std::max<uint32_t>(1, std::min<uint32_t>(byteCount / sizeof(float), 16));
+		float* values = reinterpret_cast<float*>(ov.bytes.data() + var.offset);
+
+		if (var.varType == D3D_SVT_FLOAT)
+		{
+			if (componentCount <= 1)
+				changed = ImGui::DragFloat(var.name.c_str(), values, 0.01f, -100000.0f, 100000.0f, "%.6f");
+			else
+			{
+				uint32_t remaining = componentCount;
+				uint32_t row = 0;
+				while (remaining > 0)
+				{
+					const uint32_t rowComponents = std::min<uint32_t>(remaining, 4);
+					std::string label = row == 0 ? var.name : (var.name + "[" + std::to_string(row) + "]");
+					switch (rowComponents)
+					{
+						case 1: changed |= ImGui::DragFloat(label.c_str(), values + row * 4, 0.01f, -100000.0f, 100000.0f, "%.6f"); break;
+						case 2: changed |= ImGui::DragFloat2(label.c_str(), values + row * 4, 0.01f, -100000.0f, 100000.0f, "%.6f"); break;
+						case 3: changed |= ImGui::DragFloat3(label.c_str(), values + row * 4, 0.01f, -100000.0f, 100000.0f, "%.6f"); break;
+						default: changed |= ImGui::DragFloat4(label.c_str(), values + row * 4, 0.01f, -100000.0f, 100000.0f, "%.6f"); break;
+					}
+					remaining -= rowComponents;
+					++row;
+				}
+			}
+		}
+		else
+		{
+			uint32_t* raw = reinterpret_cast<uint32_t*>(ov.bytes.data() + var.offset);
+			for (uint32_t i = 0; i < componentCount; ++i)
+			{
+				std::string label = i == 0 ? var.name : (var.name + "." + std::to_string(i));
+				int tmp = static_cast<int>(raw[i]);
+				if (ImGui::DragInt(label.c_str(), &tmp, 1.0f))
+				{
+					raw[i] = static_cast<uint32_t>(tmp);
+					changed = true;
+				}
+			}
+		}
+
+		if (changed)
+			uploadConstantBufferOverride(dev, var.bindPoint);
+		ImGui::PopID();
+	}
+
+	ImGui::End();
+	if (!g_showPixelShaderVariableEditor)
+		destroyPixelConstantBufferOverrides(dev);
 }
 
 static void onReshadeOverlay(reshade::api::effect_runtime *runtime)
 {
+	displayPixelShaderVariableEditor(runtime);
+
 	// Export-result popup
 	if (g_showExportResult)
 	{
@@ -1583,6 +2085,8 @@ bool blockDrawCallForCommandList(command_list* commandList)
 	const CommandListDataContainer &commandListData = commandList->get_private_data<CommandListDataContainer>();
 	uint32_t shaderHash = g_pixelShaderManager.getShaderHash(commandListData.activePixelShaderPipeline);
 	bool blockCall = g_pixelShaderManager.isBlockedShader(shaderHash);
+	if (g_showPixelShaderVariableEditor && shaderHash != 0 && shaderHash == g_variableEditorShaderHash)
+		blockCall = false;
 	for(auto& group : g_toggleGroups)
 	{
 		blockCall |= group.isBlockedPixelShader(shaderHash);
@@ -1602,10 +2106,55 @@ bool blockDrawCallForCommandList(command_list* commandList)
 	return blockCall;
 }
 
+static void applyPixelConstantBufferOverridesForDraw(command_list* commandList)
+{
+	if (!commandList || t_inConstantBufferOverridePush || !g_showPixelShaderVariableEditor || g_variableEditorShaderHash == 0)
+		return;
+
+	CommandListDataContainer& data = commandList->get_private_data<CommandListDataContainer>();
+	const uint32_t shaderHash = g_pixelShaderManager.getShaderHash(data.activePixelShaderPipeline);
+	if (shaderHash != g_variableEditorShaderHash)
+		return;
+
+	std::array<buffer_range, MAX_PS_CB_SLOTS> replacements = {};
+	std::array<bool, MAX_PS_CB_SLOTS> shouldPush = {};
+	{
+		std::lock_guard<std::mutex> lock(g_constantBufferMutex);
+		for (uint32_t slot = 0; slot < MAX_PS_CB_SLOTS; ++slot)
+		{
+			const ConstantBufferOverride& ov = g_pixelCBOverrides[slot];
+			if (!ov.replacement.handle || !data.pixelCBs[slot].buffer.handle || data.pixelCBs[slot].buffer.handle != ov.original.handle || !data.pixelCBLayouts[slot].handle)
+				continue;
+
+			replacements[slot] = data.pixelCBs[slot];
+			replacements[slot].buffer = ov.replacement;
+			replacements[slot].offset = 0;
+			replacements[slot].size = ov.bytes.size();
+			shouldPush[slot] = true;
+		}
+	}
+
+	t_inConstantBufferOverridePush = true;
+	for (uint32_t slot = 0; slot < MAX_PS_CB_SLOTS; ++slot)
+	{
+		if (!shouldPush[slot])
+			continue;
+
+		descriptor_set_update update = {};
+		update.binding = slot;
+		update.count = 1;
+		update.type = descriptor_type::constant_buffer;
+		update.descriptors = &replacements[slot];
+		commandList->push_descriptors(shader_stage::pixel, data.pixelCBLayouts[slot], data.pixelCBLayoutParams[slot], update);
+	}
+	t_inConstantBufferOverridePush = false;
+}
+
 
 static bool onDraw(command_list* commandList, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance)
 {
 	captureHuntedShaderSRVs(commandList);
+	applyPixelConstantBufferOverridesForDraw(commandList);
 	return blockDrawCallForCommandList(commandList);
 }
 
@@ -1613,6 +2162,7 @@ static bool onDraw(command_list* commandList, uint32_t vertex_count, uint32_t in
 static bool onDrawIndexed(command_list* commandList, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
 {
 	captureHuntedShaderSRVs(commandList);
+	applyPixelConstantBufferOverridesForDraw(commandList);
 	return blockDrawCallForCommandList(commandList);
 }
 
@@ -1626,6 +2176,7 @@ static bool onDrawOrDispatchIndirect(command_list* commandList, indirect_command
 		case indirect_command::draw_indexed:
 		case indirect_command::dispatch:
 			captureHuntedShaderSRVs(commandList);
+			applyPixelConstantBufferOverridesForDraw(commandList);
 			return blockDrawCallForCommandList(commandList);
 		// the rest aren't blocked
 	}
@@ -1730,8 +2281,19 @@ static void onReshadePresent(effect_runtime* runtime)
 		}
 	}
 
+	// Numpad +: open/edit reflected constant-buffer variables for the current hunted pixel shader.
+	if (runtime->is_key_pressed(VK_ADD)
+	    && g_pixelShaderManager.isInHuntingMode()
+	    && g_activeCollectorFrameCounter == 0
+	    && g_pixelShaderManager.getActiveHuntedShaderHash() != 0)
+	{
+		seedPixelShaderVariableEditor(runtime);
+	}
+
 	// Clear after export check so next frame starts fresh
 	g_lastHuntedPixelSRVs.clear();
+	for (ConstantBufferSnapshot& snap : g_lastHuntedPixelCBs)
+		snap = {};
 }
 
 
@@ -1850,6 +2412,7 @@ static void displaySettings(reshade::api::effect_runtime* runtime)
 		ImGui::TextUnformatted("* Numpad 9: mark/unmark the current compute shader as being part of the group");
 		ImGui::TextUnformatted("* Numpad 0: export textures bound to the current pixel shader as PNG files (filename includes content hash)");
 		ImGui::TextUnformatted("* Ctrl+Numpad 0: scan the addon folder for override PNGs and inject them (replace matching textures in-game)");
+		ImGui::TextUnformatted("* Numpad +: open editable constant-buffer variables for the current pixel shader");
 		ImGui::TextUnformatted("\nWhen you step through the shaders, the current shader is disabled in the 3D scene so you can see if that's the shader you were looking for.");
 		ImGui::TextUnformatted("When you're done, make sure you click 'Save all toggle groups' to preserve the groups you defined so next time you start your game they're loaded in and you can use them right away.");
 		ImGui::PopTextWrapPos();
@@ -2085,11 +2648,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 			reshade::register_event<reshade::addon_event::push_descriptors>(onPushDescriptors);
 			reshade::register_event<reshade::addon_event::init_resource>(onInitResource);
 			reshade::register_event<reshade::addon_event::destroy_resource>(onDestroyResource);
+			reshade::register_event<reshade::addon_event::update_buffer_region>(onUpdateBufferRegion);
+			reshade::register_event<reshade::addon_event::map_buffer_region>(onMapBufferRegion);
+			reshade::register_event<reshade::addon_event::unmap_buffer_region>(onUnmapBufferRegion);
 			reshade::register_overlay(nullptr, &displaySettings);
 			loadShortcakeIniFile();
 		}
 		break;
 	case DLL_PROCESS_DETACH:
+		destroyPixelConstantBufferOverrides(g_device);
 		reshade::unregister_event<reshade::addon_event::reshade_present>(onReshadePresent);
 		reshade::unregister_event<reshade::addon_event::destroy_pipeline>(onDestroyPipeline);
 		reshade::unregister_event<reshade::addon_event::init_pipeline>(onInitPipeline);
@@ -2101,6 +2668,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 		reshade::unregister_event<reshade::addon_event::push_descriptors>(onPushDescriptors);
 		reshade::unregister_event<reshade::addon_event::init_resource>(onInitResource);
 		reshade::unregister_event<reshade::addon_event::destroy_resource>(onDestroyResource);
+		reshade::unregister_event<reshade::addon_event::update_buffer_region>(onUpdateBufferRegion);
+		reshade::unregister_event<reshade::addon_event::map_buffer_region>(onMapBufferRegion);
+		reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(onUnmapBufferRegion);
 		reshade::unregister_event<reshade::addon_event::init_command_list>(onInitCommandList);
 		reshade::unregister_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
 		reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandList);
