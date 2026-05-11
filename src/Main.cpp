@@ -36,6 +36,7 @@
 
 #include <imgui.h>
 #include <reshade.hpp>
+#include <d3d11.h>
 #include <d3dcompiler.h>
 #include <d3d11shader.h>
 #include <wrl/client.h>
@@ -138,6 +139,7 @@ struct ConstantBufferOverride
 	resource replacement = { 0 };
 	uint64_t sourceOffset = 0;
 	std::vector<uint8_t> bytes;
+	std::vector<uint8_t> originalBytes;
 };
 
 struct MappedConstantBuffer
@@ -281,12 +283,20 @@ static void destroyPixelConstantBufferOverrides(device* dev)
 	if (!dev)
 		return;
 
-	std::lock_guard<std::mutex> lock(g_constantBufferMutex);
-	for (ConstantBufferOverride& ov : g_pixelCBOverrides)
+	std::array<ConstantBufferOverride, MAX_PS_CB_SLOTS> oldOverrides = {};
 	{
+		std::lock_guard<std::mutex> lock(g_constantBufferMutex);
+		oldOverrides = g_pixelCBOverrides;
+		for (ConstantBufferOverride& ov : g_pixelCBOverrides)
+			ov = {};
+	}
+
+	for (ConstantBufferOverride& ov : oldOverrides)
+	{
+		if (ov.original.handle && !ov.originalBytes.empty())
+			dev->update_buffer_region(ov.originalBytes.data(), ov.original, ov.sourceOffset, ov.originalBytes.size());
 		if (ov.replacement.handle)
 			dev->destroy_resource(ov.replacement);
-		ov = {};
 	}
 }
 
@@ -321,6 +331,7 @@ static void seedPixelShaderVariableEditor(effect_runtime* runtime)
 		g_pixelCBOverrides[slot].replacement = replacement;
 		g_pixelCBOverrides[slot].sourceOffset = snap.range.offset;
 		g_pixelCBOverrides[slot].bytes = snap.bytes;
+		g_pixelCBOverrides[slot].originalBytes = snap.bytes;
 	}
 }
 
@@ -330,7 +341,11 @@ static void uploadConstantBufferOverride(device* dev, uint32_t slot)
 		return;
 
 	ConstantBufferOverride& ov = g_pixelCBOverrides[slot];
-	if (ov.replacement.handle && !ov.bytes.empty())
+	if (ov.bytes.empty())
+		return;
+	if (ov.original.handle)
+		dev->update_buffer_region(ov.bytes.data(), ov.original, ov.sourceOffset, ov.bytes.size());
+	if (ov.replacement.handle)
 		dev->update_buffer_region(ov.bytes.data(), ov.replacement, 0, ov.bytes.size());
 }
 
@@ -2118,6 +2133,8 @@ static void applyPixelConstantBufferOverridesForDraw(command_list* commandList)
 
 	std::array<buffer_range, MAX_PS_CB_SLOTS> replacements = {};
 	std::array<bool, MAX_PS_CB_SLOTS> shouldPush = {};
+	struct DirectBufferUpdate { resource buffer; uint64_t offset; std::vector<uint8_t> bytes; };
+	std::vector<DirectBufferUpdate> directUpdates;
 	{
 		std::lock_guard<std::mutex> lock(g_constantBufferMutex);
 		for (uint32_t slot = 0; slot < MAX_PS_CB_SLOTS; ++slot)
@@ -2131,6 +2148,26 @@ static void applyPixelConstantBufferOverridesForDraw(command_list* commandList)
 			replacements[slot].offset = 0;
 			replacements[slot].size = ov.bytes.size();
 			shouldPush[slot] = true;
+			directUpdates.push_back({ ov.original, ov.sourceOffset, ov.bytes });
+		}
+	}
+
+	if (g_device)
+	{
+		for (const DirectBufferUpdate& update : directUpdates)
+			if (update.buffer.handle && !update.bytes.empty())
+				g_device->update_buffer_region(update.bytes.data(), update.buffer, update.offset, update.bytes.size());
+	}
+
+	if (ID3D11DeviceContext* d3d11Context = reinterpret_cast<ID3D11DeviceContext*>(commandList->get_native()))
+	{
+		for (uint32_t slot = 0; slot < MAX_PS_CB_SLOTS; ++slot)
+		{
+			if (!shouldPush[slot] || !replacements[slot].buffer.handle)
+				continue;
+
+			ID3D11Buffer* d3d11Buffer = reinterpret_cast<ID3D11Buffer*>(replacements[slot].buffer.handle);
+			d3d11Context->PSSetConstantBuffers(slot, 1, &d3d11Buffer);
 		}
 	}
 
