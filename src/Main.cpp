@@ -55,6 +55,9 @@
 #include <cstring>
 #include <cstdio>
 #include <array>
+#include <fstream>
+#include <sstream>
+#include <cctype>
 
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -66,15 +69,24 @@ extern "C" __declspec(dllexport) const char *DESCRIPTION = "Add-on which allows 
 
 static constexpr uint32_t MAX_PS_SRV_SLOTS = 128;
 static constexpr uint32_t MAX_PS_CB_SLOTS = 32;
+static constexpr uint32_t MAX_VERTEX_BUFFER_SLOTS = 32;
 
 struct __declspec(uuid("038B03AA-4C75-443B-A695-752D80797037")) CommandListDataContainer {
     uint64_t activePixelShaderPipeline;
     uint64_t activeVertexShaderPipeline;
 	uint64_t activeComputeShaderPipeline;
+	uint64_t activeInputLayoutPipeline;
+	primitive_topology activeTopology;
     resource_view pixelSRVs[MAX_PS_SRV_SLOTS]; // current SRVs bound to the pixel-shader stage
     buffer_range pixelCBs[MAX_PS_CB_SLOTS]; // current constant buffers bound to the pixel-shader stage
     pipeline_layout pixelCBLayouts[MAX_PS_CB_SLOTS];
     uint32_t pixelCBLayoutParams[MAX_PS_CB_SLOTS];
+	resource vertexBuffers[MAX_VERTEX_BUFFER_SLOTS];
+	uint64_t vertexBufferOffsets[MAX_VERTEX_BUFFER_SLOTS];
+	uint32_t vertexBufferStrides[MAX_VERTEX_BUFFER_SLOTS];
+	resource indexBuffer;
+	uint64_t indexBufferOffset;
+	uint32_t indexSize;
 };
 
 #define FRAMECOUNT_COLLECTION_PHASE_DEFAULT 250;
@@ -107,6 +119,37 @@ static KeyRepeatState g_keyRepeat[9]; // one per numpad 1-9
 static std::vector<resource_view> g_lastHuntedPixelSRVs;
 static std::vector<std::string>   g_exportResultLines;
 static bool                       g_showExportResult = false;
+
+// Mesh-export state
+struct PipelineInputLayoutInfo
+{
+	std::vector<input_element> elements;
+	primitive_topology topology = primitive_topology::undefined;
+};
+
+struct CapturedMeshDraw
+{
+	uint32_t shaderHash = 0;
+	bool indexed = false;
+	uint32_t vertexCount = 0;
+	uint32_t instanceCount = 0;
+	uint32_t firstVertex = 0;
+	uint32_t firstInstance = 0;
+	uint32_t indexCount = 0;
+	uint32_t firstIndex = 0;
+	int32_t vertexOffset = 0;
+	primitive_topology topology = primitive_topology::undefined;
+	std::vector<input_element> inputElements;
+	resource vertexBuffers[MAX_VERTEX_BUFFER_SLOTS] = {};
+	uint64_t vertexBufferOffsets[MAX_VERTEX_BUFFER_SLOTS] = {};
+	uint32_t vertexBufferStrides[MAX_VERTEX_BUFFER_SLOTS] = {};
+	resource indexBuffer = {};
+	uint64_t indexBufferOffset = 0;
+	uint32_t indexSize = 0;
+};
+
+static std::unordered_map<uint64_t, PipelineInputLayoutInfo> g_inputLayoutPipelines;
+static std::vector<CapturedMeshDraw> g_lastHuntedMeshDraws;
 
 // Pixel-shader constant-buffer editor state
 struct ShaderVariableInfo
@@ -450,15 +493,26 @@ static void onResetCommandList(command_list *commandList)
 	commandListData.activePixelShaderPipeline = -1;
 	commandListData.activeVertexShaderPipeline = -1;
 	commandListData.activeComputeShaderPipeline = -1;
+	commandListData.activeInputLayoutPipeline = -1;
+	commandListData.activeTopology = primitive_topology::undefined;
 	memset(commandListData.pixelSRVs, 0, sizeof(commandListData.pixelSRVs));
 	memset(commandListData.pixelCBs, 0, sizeof(commandListData.pixelCBs));
 	memset(commandListData.pixelCBLayouts, 0, sizeof(commandListData.pixelCBLayouts));
 	memset(commandListData.pixelCBLayoutParams, 0, sizeof(commandListData.pixelCBLayoutParams));
+	memset(commandListData.vertexBuffers, 0, sizeof(commandListData.vertexBuffers));
+	memset(commandListData.vertexBufferOffsets, 0, sizeof(commandListData.vertexBufferOffsets));
+	memset(commandListData.vertexBufferStrides, 0, sizeof(commandListData.vertexBufferStrides));
+	commandListData.indexBuffer = {};
+	commandListData.indexBufferOffset = 0;
+	commandListData.indexSize = 0;
 }
 
 
 static void onInitPipeline(device *device, pipeline_layout, uint32_t subobjectCount, const pipeline_subobject *subobjects, pipeline pipelineHandle)
 {
+	PipelineInputLayoutInfo layoutInfo;
+	bool hasInputLayout = false;
+
 	// shader has been created, we will now create a hash and store it with the handle we got.
 	for (uint32_t i = 0; i < subobjectCount; ++i)
 	{
@@ -481,8 +535,23 @@ static void onInitPipeline(device *device, pipeline_layout, uint32_t subobjectCo
 			case pipeline_subobject_type::compute_shader:
 				g_computeShaderManager.addHashHandlePair(calculateShaderHash(subobjects[i].data), pipelineHandle.handle);
 				break;
+			case pipeline_subobject_type::input_layout:
+				if (subobjects[i].data && subobjects[i].count > 0)
+				{
+					const input_element* elements = static_cast<const input_element*>(subobjects[i].data);
+					layoutInfo.elements.assign(elements, elements + subobjects[i].count);
+					hasInputLayout = true;
+				}
+				break;
+			case pipeline_subobject_type::primitive_topology:
+				if (subobjects[i].data)
+					layoutInfo.topology = *static_cast<const primitive_topology*>(subobjects[i].data);
+				break;
 		}
 	}
+
+	if (hasInputLayout || layoutInfo.topology != primitive_topology::undefined)
+		g_inputLayoutPipelines[pipelineHandle.handle] = std::move(layoutInfo);
 }
 
 
@@ -491,6 +560,7 @@ static void onDestroyPipeline(device *device, pipeline pipelineHandle)
 	g_pixelShaderManager.removeHandle(pipelineHandle.handle);
 	g_vertexShaderManager.removeHandle(pipelineHandle.handle);
 	g_computeShaderManager.removeHandle(pipelineHandle.handle);
+	g_inputLayoutPipelines.erase(pipelineHandle.handle);
 }
 
 
@@ -2027,12 +2097,20 @@ static void onBindPipeline(command_list* commandList, pipeline_stage stages, pip
 		const bool handleHasPixelShaderAttached = g_pixelShaderManager.isKnownHandle(pipelineHandle.handle);
 		const bool handleHasVertexShaderAttached = g_vertexShaderManager.isKnownHandle(pipelineHandle.handle);
 		const bool handleHasComputeShaderAttached = g_computeShaderManager.isKnownHandle(pipelineHandle.handle);
-		if(!handleHasPixelShaderAttached && !handleHasVertexShaderAttached && !handleHasComputeShaderAttached)
+		const auto inputLayoutIt = g_inputLayoutPipelines.find(pipelineHandle.handle);
+		const bool handleHasInputLayout = inputLayoutIt != g_inputLayoutPipelines.end();
+		if(!handleHasPixelShaderAttached && !handleHasVertexShaderAttached && !handleHasComputeShaderAttached && !handleHasInputLayout)
 		{
 			// draw call with unknown handle, don't collect it
 			return;
 		}
 		CommandListDataContainer& commandListData = commandList->get_private_data<CommandListDataContainer>();
+		if((stages & pipeline_stage::input_assembler) == pipeline_stage::input_assembler && handleHasInputLayout)
+		{
+			commandListData.activeInputLayoutPipeline = pipelineHandle.handle;
+			if (inputLayoutIt->second.topology != primitive_topology::undefined)
+				commandListData.activeTopology = inputLayoutIt->second.topology;
+		}
 		// always do the following code as that has to run for every bind on a pipeline:
 		if(g_activeCollectorFrameCounter > 0)
 		{
@@ -2092,6 +2170,35 @@ static void onBindPipeline(command_list* commandList, pipeline_stage stages, pip
 				commandListData.activeComputeShaderPipeline = pipelineHandle.handle;
 			}
 		}
+	}
+}
+
+static void onBindIndexBuffer(command_list* commandList, resource buffer, uint64_t offset, uint32_t indexSize)
+{
+	if (!commandList)
+		return;
+
+	CommandListDataContainer& data = commandList->get_private_data<CommandListDataContainer>();
+	data.indexBuffer = buffer;
+	data.indexBufferOffset = offset;
+	data.indexSize = indexSize;
+}
+
+static void onBindVertexBuffers(command_list* commandList, uint32_t first, uint32_t count, const resource* buffers, const uint64_t* offsets, const uint32_t* strides)
+{
+	if (!commandList || !buffers || !offsets || !strides)
+		return;
+
+	CommandListDataContainer& data = commandList->get_private_data<CommandListDataContainer>();
+	for (uint32_t i = 0; i < count; ++i)
+	{
+		const uint32_t slot = first + i;
+		if (slot >= MAX_VERTEX_BUFFER_SLOTS)
+			continue;
+
+		data.vertexBuffers[slot] = buffers[i];
+		data.vertexBufferOffsets[slot] = offsets[i];
+		data.vertexBufferStrides[slot] = strides[i];
 	}
 }
 
@@ -2198,10 +2305,344 @@ static void applyPixelConstantBufferOverridesForDraw(command_list* commandList)
 	t_inConstantBufferOverridePush = false;
 }
 
+static bool semanticEquals(const char* semantic, const char* wanted)
+{
+	if (!semantic || !wanted)
+		return false;
+
+	while (*semantic && *wanted)
+	{
+		if (std::toupper(static_cast<unsigned char>(*semantic)) != std::toupper(static_cast<unsigned char>(*wanted)))
+			return false;
+		++semantic;
+		++wanted;
+	}
+	return *semantic == 0 && *wanted == 0;
+}
+
+static bool isFloatFormat(reshade::api::format fmt, uint32_t& components)
+{
+	switch (fmt)
+	{
+		case reshade::api::format::r32_float: components = 1; return true;
+		case reshade::api::format::r32g32_float: components = 2; return true;
+		case reshade::api::format::r32g32b32_float: components = 3; return true;
+		case reshade::api::format::r32g32b32a32_float: components = 4; return true;
+		default: return false;
+	}
+}
+
+static bool readFloatVector(const std::vector<uint8_t>& bytes, uint64_t offset, reshade::api::format fmt, float out[4])
+{
+	uint32_t components = 0;
+	if (!isFloatFormat(fmt, components) || offset + components * sizeof(float) > bytes.size())
+		return false;
+
+	const float* source = reinterpret_cast<const float*>(bytes.data() + offset);
+	for (uint32_t i = 0; i < 4; ++i)
+		out[i] = i < components ? source[i] : 0.0f;
+	return true;
+}
+
+static bool copyBufferBytes(effect_runtime* runtime, resource source, uint64_t offset, uint64_t size, std::vector<uint8_t>& outBytes)
+{
+	if (!runtime || !source.handle || size == 0 || size > 128ull * 1024ull * 1024ull)
+		return false;
+
+	device* dev = runtime->get_command_queue()->get_device();
+	command_queue* queue = runtime->get_command_queue();
+	command_list* cmd = queue ? queue->get_immediate_command_list() : nullptr;
+	if (!dev || !queue || !cmd)
+		return false;
+
+	resource staging = {};
+	const resource_desc stagingDesc(size, memory_heap::gpu_to_cpu, resource_usage::copy_dest);
+	if (!dev->create_resource(stagingDesc, nullptr, resource_usage::copy_dest, &staging))
+		return false;
+
+	cmd->copy_buffer_region(source, offset, staging, 0, size);
+	queue->flush_immediate_command_list();
+	queue->wait_idle();
+
+	bool ok = false;
+	void* mapped = nullptr;
+	if (dev->map_buffer_region(staging, 0, size, map_access::read_only, &mapped) && mapped)
+	{
+		outBytes.resize(static_cast<size_t>(size));
+		memcpy(outBytes.data(), mapped, static_cast<size_t>(size));
+		dev->unmap_buffer_region(staging);
+		ok = true;
+	}
+
+	dev->destroy_resource(staging);
+	return ok;
+}
+
+static void captureHuntedMeshDraw(command_list* commandList, bool indexed, uint32_t vertexCount, uint32_t instanceCount,
+                                  uint32_t firstVertex, uint32_t firstInstance, uint32_t indexCount,
+                                  uint32_t firstIndex, int32_t vertexOffset)
+{
+	if (!commandList || !g_pixelShaderManager.isInHuntingMode() || g_activeCollectorFrameCounter > 0)
+		return;
+
+	const CommandListDataContainer& data = commandList->get_private_data<CommandListDataContainer>();
+	const uint32_t shaderHash = g_pixelShaderManager.getShaderHash(data.activePixelShaderPipeline);
+	if (!shaderHash || shaderHash != g_pixelShaderManager.getActiveHuntedShaderHash())
+		return;
+
+	const auto layoutIt = g_inputLayoutPipelines.find(data.activeInputLayoutPipeline);
+	if (layoutIt == g_inputLayoutPipelines.end() || layoutIt->second.elements.empty())
+		return;
+
+	if (g_lastHuntedMeshDraws.size() >= 256)
+		return;
+
+	CapturedMeshDraw draw;
+	draw.shaderHash = shaderHash;
+	draw.indexed = indexed;
+	draw.vertexCount = vertexCount;
+	draw.instanceCount = instanceCount;
+	draw.firstVertex = firstVertex;
+	draw.firstInstance = firstInstance;
+	draw.indexCount = indexCount;
+	draw.firstIndex = firstIndex;
+	draw.vertexOffset = vertexOffset;
+	draw.topology = data.activeTopology != primitive_topology::undefined ? data.activeTopology : layoutIt->second.topology;
+	if (draw.topology == primitive_topology::undefined)
+	{
+		if (ID3D11DeviceContext* d3d11Context = reinterpret_cast<ID3D11DeviceContext*>(commandList->get_native()))
+		{
+			D3D11_PRIMITIVE_TOPOLOGY d3dTopology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+			d3d11Context->IAGetPrimitiveTopology(&d3dTopology);
+			switch (d3dTopology)
+			{
+				case D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST: draw.topology = primitive_topology::triangle_list; break;
+				case D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP: draw.topology = primitive_topology::triangle_strip; break;
+				case D3D11_PRIMITIVE_TOPOLOGY_LINELIST: draw.topology = primitive_topology::line_list; break;
+				case D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP: draw.topology = primitive_topology::line_strip; break;
+				case D3D11_PRIMITIVE_TOPOLOGY_POINTLIST: draw.topology = primitive_topology::point_list; break;
+				default: break;
+			}
+		}
+	}
+	if (draw.topology == primitive_topology::undefined)
+		draw.topology = primitive_topology::triangle_list;
+	draw.inputElements = layoutIt->second.elements;
+	memcpy(draw.vertexBuffers, data.vertexBuffers, sizeof(draw.vertexBuffers));
+	memcpy(draw.vertexBufferOffsets, data.vertexBufferOffsets, sizeof(draw.vertexBufferOffsets));
+	memcpy(draw.vertexBufferStrides, data.vertexBufferStrides, sizeof(draw.vertexBufferStrides));
+	draw.indexBuffer = data.indexBuffer;
+	draw.indexBufferOffset = data.indexBufferOffset;
+	draw.indexSize = data.indexSize;
+	g_lastHuntedMeshDraws.push_back(std::move(draw));
+}
+
+static std::vector<std::string> exportMeshes(effect_runtime* runtime, uint32_t shaderHash)
+{
+	std::vector<std::string> results;
+	if (g_lastHuntedMeshDraws.empty())
+	{
+		results.push_back("Nothing to export - shader did not draw this frame.");
+		return results;
+	}
+
+	const std::filesystem::path exportDir = std::filesystem::path(g_iniFileName).parent_path() / "shortcake";
+	std::filesystem::create_directories(exportDir);
+
+	const std::string baseName = "mesh_ps_" + toHexStr(shaderHash) + "_" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+	const std::filesystem::path objPath = exportDir / (baseName + ".obj");
+	const std::filesystem::path metaPath = exportDir / (baseName + ".txt");
+	std::ofstream obj(objPath);
+	std::ofstream meta(metaPath);
+	if (!obj || !meta)
+	{
+		results.push_back("Mesh export failed: could not create output files.");
+		return results;
+	}
+
+	obj << "# Strawberry Shortcake mesh export for pixel shader 0x" << toHexStr(shaderHash) << "\n";
+	meta << "Captured draw candidates: " << g_lastHuntedMeshDraws.size() << "\n";
+	size_t vertexBase = 1;
+	size_t writtenDraws = 0;
+	size_t skippedDraws = 0;
+
+	for (size_t drawIndex = 0; drawIndex < g_lastHuntedMeshDraws.size(); ++drawIndex)
+	{
+		const CapturedMeshDraw& draw = g_lastHuntedMeshDraws[drawIndex];
+		if (draw.shaderHash != shaderHash)
+		{
+			meta << "Skipped draw " << drawIndex << ": shader mismatch 0x" << toHexStr(draw.shaderHash) << "\n";
+			continue;
+		}
+		if (draw.topology != primitive_topology::triangle_list && draw.topology != primitive_topology::triangle_strip)
+		{
+			++skippedDraws;
+			meta << "Skipped draw " << drawIndex << ": unsupported topology " << static_cast<uint32_t>(draw.topology) << "\n";
+			continue;
+		}
+
+		const input_element* posElement = nullptr;
+		for (const input_element& element : draw.inputElements)
+		{
+			if ((semanticEquals(element.semantic, "POSITION") || semanticEquals(element.semantic, "POS")) && element.instance_step_rate == 0)
+			{
+				uint32_t components = 0;
+				if (isFloatFormat(element.format, components) && components >= 3)
+				{
+					posElement = &element;
+					break;
+				}
+			}
+		}
+		if (!posElement || posElement->buffer_binding >= MAX_VERTEX_BUFFER_SLOTS || !draw.vertexBuffers[posElement->buffer_binding].handle)
+		{
+			++skippedDraws;
+			meta << "Skipped draw " << drawIndex << ": no float3/float4 POSITION input found.\n";
+			continue;
+		}
+
+		uint32_t stride = posElement->stride ? posElement->stride : draw.vertexBufferStrides[posElement->buffer_binding];
+		if (stride == 0)
+		{
+			++skippedDraws;
+			meta << "Skipped draw " << drawIndex << ": unknown vertex stride.\n";
+			continue;
+		}
+
+		std::vector<uint32_t> indices;
+		uint32_t minVertex = draw.indexed ? UINT32_MAX : draw.firstVertex;
+		uint32_t maxVertex = draw.indexed ? 0 : (draw.firstVertex + draw.vertexCount - 1);
+		if (draw.indexed)
+		{
+			if (!draw.indexBuffer.handle || (draw.indexSize != 2 && draw.indexSize != 4))
+			{
+				++skippedDraws;
+				meta << "Skipped draw " << drawIndex << ": unsupported or missing index buffer.\n";
+				continue;
+			}
+
+			std::vector<uint8_t> indexBytes;
+			const uint64_t indexOffset = draw.indexBufferOffset + static_cast<uint64_t>(draw.firstIndex) * draw.indexSize;
+			const uint64_t indexBytesSize = static_cast<uint64_t>(draw.indexCount) * draw.indexSize;
+			if (!copyBufferBytes(runtime, draw.indexBuffer, indexOffset, indexBytesSize, indexBytes))
+			{
+				++skippedDraws;
+				meta << "Skipped draw " << drawIndex << ": could not read index buffer.\n";
+				continue;
+			}
+
+			indices.resize(draw.indexCount);
+			for (uint32_t i = 0; i < draw.indexCount; ++i)
+			{
+				uint32_t idx = draw.indexSize == 2
+					? static_cast<uint32_t>(reinterpret_cast<const uint16_t*>(indexBytes.data())[i])
+					: reinterpret_cast<const uint32_t*>(indexBytes.data())[i];
+				const int64_t adjusted = static_cast<int64_t>(idx) + draw.vertexOffset;
+				if (adjusted < 0)
+					continue;
+				idx = static_cast<uint32_t>(adjusted);
+				indices[i] = idx;
+				minVertex = std::min(minVertex, idx);
+				maxVertex = std::max(maxVertex, idx);
+			}
+		}
+
+		if (minVertex > maxVertex)
+		{
+			++skippedDraws;
+			meta << "Skipped draw " << drawIndex << ": empty vertex range.\n";
+			continue;
+		}
+
+		std::vector<uint8_t> vertexBytes;
+		const uint64_t vbOffset = draw.vertexBufferOffsets[posElement->buffer_binding] + static_cast<uint64_t>(minVertex) * stride;
+		const uint64_t vbSize = static_cast<uint64_t>(maxVertex - minVertex + 1) * stride;
+		if (!copyBufferBytes(runtime, draw.vertexBuffers[posElement->buffer_binding], vbOffset, vbSize, vertexBytes))
+		{
+			++skippedDraws;
+			meta << "Skipped draw " << drawIndex << ": could not read vertex buffer.\n";
+			continue;
+		}
+
+		obj << "o draw_" << drawIndex << "\n";
+		for (uint32_t v = minVertex; v <= maxVertex; ++v)
+		{
+			float pos[4] = {};
+			const uint64_t localOffset = static_cast<uint64_t>(v - minVertex) * stride + posElement->offset;
+			if (!readFloatVector(vertexBytes, localOffset, posElement->format, pos))
+				pos[0] = pos[1] = pos[2] = 0.0f;
+			obj << "v " << pos[0] << " " << pos[1] << " " << pos[2] << "\n";
+		}
+
+		auto objIndex = [&](uint32_t vertex) -> size_t
+		{
+			return vertexBase + static_cast<size_t>(vertex - minVertex);
+		};
+
+		if (draw.indexed)
+		{
+			if (draw.topology == primitive_topology::triangle_list)
+			{
+				for (uint32_t i = 0; i + 2 < indices.size(); i += 3)
+					obj << "f " << objIndex(indices[i + 0]) << " " << objIndex(indices[i + 1]) << " " << objIndex(indices[i + 2]) << "\n";
+			}
+			else
+			{
+				for (uint32_t i = 0; i + 2 < indices.size(); ++i)
+				{
+					const uint32_t a = indices[i + 0], b = indices[i + 1], c = indices[i + 2];
+					if (a == b || b == c || a == c) continue;
+					if ((i & 1) == 0)
+						obj << "f " << objIndex(a) << " " << objIndex(b) << " " << objIndex(c) << "\n";
+					else
+						obj << "f " << objIndex(b) << " " << objIndex(a) << " " << objIndex(c) << "\n";
+				}
+			}
+		}
+		else
+		{
+			if (draw.topology == primitive_topology::triangle_list)
+			{
+				for (uint32_t i = 0; i + 2 < draw.vertexCount; i += 3)
+					obj << "f " << objIndex(draw.firstVertex + i + 0) << " " << objIndex(draw.firstVertex + i + 1) << " " << objIndex(draw.firstVertex + i + 2) << "\n";
+			}
+			else
+			{
+				for (uint32_t i = 0; i + 2 < draw.vertexCount; ++i)
+				{
+					const uint32_t a = draw.firstVertex + i + 0, b = draw.firstVertex + i + 1, c = draw.firstVertex + i + 2;
+					if ((i & 1) == 0)
+						obj << "f " << objIndex(a) << " " << objIndex(b) << " " << objIndex(c) << "\n";
+					else
+						obj << "f " << objIndex(b) << " " << objIndex(a) << " " << objIndex(c) << "\n";
+				}
+			}
+		}
+
+		vertexBase += static_cast<size_t>(maxVertex - minVertex + 1);
+		++writtenDraws;
+		meta << "Exported draw " << drawIndex << ": vertices " << minVertex << "-" << maxVertex
+		     << ", topology " << static_cast<uint32_t>(draw.topology)
+		     << ", indexed " << (draw.indexed ? "yes" : "no") << "\n";
+	}
+
+	if (writtenDraws == 0)
+	{
+		results.push_back("No exportable mesh draws found. See " + metaPath.filename().string() + ".");
+		return results;
+	}
+
+	results.push_back(objPath.filename().string() + " exported.");
+	results.push_back(std::to_string(writtenDraws) + " draw(s), " + std::to_string(skippedDraws) + " skipped.");
+	results.push_back(metaPath.filename().string() + " has layout notes.");
+	return results;
+}
+
 
 static bool onDraw(command_list* commandList, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance)
 {
 	captureHuntedShaderSRVs(commandList);
+	captureHuntedMeshDraw(commandList, false, vertex_count, instance_count, first_vertex, first_instance, 0, 0, 0);
 	applyPixelConstantBufferOverridesForDraw(commandList);
 	return blockDrawCallForCommandList(commandList);
 }
@@ -2210,6 +2651,7 @@ static bool onDraw(command_list* commandList, uint32_t vertex_count, uint32_t in
 static bool onDrawIndexed(command_list* commandList, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
 {
 	captureHuntedShaderSRVs(commandList);
+	captureHuntedMeshDraw(commandList, true, 0, instance_count, 0, first_instance, index_count, first_index, vertex_offset);
 	applyPixelConstantBufferOverridesForDraw(commandList);
 	return blockDrawCallForCommandList(commandList);
 }
@@ -2329,6 +2771,16 @@ static void onReshadePresent(effect_runtime* runtime)
 		}
 	}
 
+	// Numpad .: export mesh draws using the current hunted pixel shader as OBJ.
+	if (runtime->is_key_pressed(VK_DECIMAL)
+	    && g_pixelShaderManager.isInHuntingMode()
+	    && g_activeCollectorFrameCounter == 0
+	    && g_pixelShaderManager.getActiveHuntedShaderHash() != 0)
+	{
+		g_exportResultLines = exportMeshes(runtime, g_pixelShaderManager.getActiveHuntedShaderHash());
+		g_showExportResult = true;
+	}
+
 	// Numpad +: open/edit reflected constant-buffer variables for the current hunted pixel shader.
 	if (runtime->is_key_pressed(VK_ADD)
 	    && g_pixelShaderManager.isInHuntingMode()
@@ -2340,6 +2792,7 @@ static void onReshadePresent(effect_runtime* runtime)
 
 	// Clear after export check so next frame starts fresh
 	g_lastHuntedPixelSRVs.clear();
+	g_lastHuntedMeshDraws.clear();
 	for (ConstantBufferSnapshot& snap : g_lastHuntedPixelCBs)
 		snap = {};
 }
@@ -2460,6 +2913,7 @@ static void displaySettings(reshade::api::effect_runtime* runtime)
 		ImGui::TextUnformatted("* Numpad 9: mark/unmark the current compute shader as being part of the group");
 		ImGui::TextUnformatted("* Numpad 0: export textures bound to the current pixel shader as PNG files (filename includes content hash)");
 		ImGui::TextUnformatted("* Ctrl+Numpad 0: scan the addon folder for override PNGs and inject them (replace matching textures in-game)");
+		ImGui::TextUnformatted("* Numpad .: export mesh draws bound to the current pixel shader as OBJ");
 		ImGui::TextUnformatted("* Numpad +: open editable constant-buffer variables for the current pixel shader");
 		ImGui::TextUnformatted("\nWhen you step through the shaders, the current shader is disabled in the 3D scene so you can see if that's the shader you were looking for.");
 		ImGui::TextUnformatted("When you're done, make sure you click 'Save all toggle groups' to preserve the groups you defined so next time you start your game they're loaded in and you can use them right away.");
@@ -2693,6 +3147,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 			reshade::register_event<reshade::addon_event::draw>(onDraw);
 			reshade::register_event<reshade::addon_event::draw_indexed>(onDrawIndexed);
 			reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(onDrawOrDispatchIndirect);
+			reshade::register_event<reshade::addon_event::bind_index_buffer>(onBindIndexBuffer);
+			reshade::register_event<reshade::addon_event::bind_vertex_buffers>(onBindVertexBuffers);
 			reshade::register_event<reshade::addon_event::push_descriptors>(onPushDescriptors);
 			reshade::register_event<reshade::addon_event::init_resource>(onInitResource);
 			reshade::register_event<reshade::addon_event::destroy_resource>(onDestroyResource);
@@ -2714,6 +3170,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 		reshade::unregister_event<reshade::addon_event::draw>(onDraw);
 		reshade::unregister_event<reshade::addon_event::draw_indexed>(onDrawIndexed);
 		reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(onDrawOrDispatchIndirect);
+		reshade::unregister_event<reshade::addon_event::bind_index_buffer>(onBindIndexBuffer);
+		reshade::unregister_event<reshade::addon_event::bind_vertex_buffers>(onBindVertexBuffers);
 		reshade::unregister_event<reshade::addon_event::push_descriptors>(onPushDescriptors);
 		reshade::unregister_event<reshade::addon_event::init_resource>(onInitResource);
 		reshade::unregister_event<reshade::addon_event::destroy_resource>(onDestroyResource);
