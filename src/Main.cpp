@@ -154,6 +154,7 @@ static std::unordered_map<uint32_t, ShaderReflectionInfo> g_pixelShaderReflectio
 static std::unordered_map<uint64_t, std::vector<uint8_t>> g_bufferSnapshots;
 static std::array<ConstantBufferSnapshot, MAX_PS_CB_SLOTS> g_lastHuntedPixelCBs;
 static bool g_showPixelShaderVariableEditor = false;
+static bool g_keepPixelShaderVariableOverrides = false;
 static uint32_t g_variableEditorShaderHash = 0;
 static std::array<ConstantBufferOverride, MAX_PS_CB_SLOTS> g_pixelCBOverrides;
 static std::unordered_map<uint64_t, MappedConstantBuffer> g_mappedConstantBuffers;
@@ -311,6 +312,7 @@ static void seedPixelShaderVariableEditor(effect_runtime* runtime)
 		return;
 
 	destroyPixelConstantBufferOverrides(dev);
+	g_keepPixelShaderVariableOverrides = false;
 	g_variableEditorShaderHash = shaderHash;
 	g_showPixelShaderVariableEditor = true;
 
@@ -1841,8 +1843,17 @@ static void displayPixelShaderVariableEditor(effect_runtime* runtime)
 	ImGui::SameLine();
 	if (ImGui::Button("Reset edits"))
 	{
+		g_keepPixelShaderVariableOverrides = false;
 		destroyPixelConstantBufferOverrides(dev);
 		seedPixelShaderVariableEditor(runtime);
+	}
+	ImGui::SameLine();
+	if (ImGui::Button("Save values"))
+		g_keepPixelShaderVariableOverrides = true;
+	if (g_keepPixelShaderVariableOverrides)
+	{
+		ImGui::SameLine();
+		ImGui::TextUnformatted("Saved");
 	}
 	ImGui::Separator();
 
@@ -1936,7 +1947,7 @@ static void displayPixelShaderVariableEditor(effect_runtime* runtime)
 	}
 
 	ImGui::End();
-	if (!g_showPixelShaderVariableEditor)
+	if (!g_showPixelShaderVariableEditor && !g_keepPixelShaderVariableOverrides)
 		destroyPixelConstantBufferOverrides(dev);
 }
 
@@ -2100,7 +2111,7 @@ bool blockDrawCallForCommandList(command_list* commandList)
 	const CommandListDataContainer &commandListData = commandList->get_private_data<CommandListDataContainer>();
 	uint32_t shaderHash = g_pixelShaderManager.getShaderHash(commandListData.activePixelShaderPipeline);
 	bool blockCall = g_pixelShaderManager.isBlockedShader(shaderHash);
-	if (g_showPixelShaderVariableEditor && shaderHash != 0 && shaderHash == g_variableEditorShaderHash)
+	if ((g_showPixelShaderVariableEditor || g_keepPixelShaderVariableOverrides) && shaderHash != 0 && shaderHash == g_variableEditorShaderHash)
 		blockCall = false;
 	for(auto& group : g_toggleGroups)
 	{
@@ -2123,7 +2134,7 @@ bool blockDrawCallForCommandList(command_list* commandList)
 
 static void applyPixelConstantBufferOverridesForDraw(command_list* commandList)
 {
-	if (!commandList || t_inConstantBufferOverridePush || !g_showPixelShaderVariableEditor || g_variableEditorShaderHash == 0)
+	if (!commandList || t_inConstantBufferOverridePush || (!g_showPixelShaderVariableEditor && !g_keepPixelShaderVariableOverrides) || g_variableEditorShaderHash == 0)
 		return;
 
 	CommandListDataContainer& data = commandList->get_private_data<CommandListDataContainer>();
@@ -2693,6 +2704,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 		}
 		break;
 	case DLL_PROCESS_DETACH:
+		g_keepPixelShaderVariableOverrides = false;
 		destroyPixelConstantBufferOverrides(g_device);
 		reshade::unregister_event<reshade::addon_event::reshade_present>(onReshadePresent);
 		reshade::unregister_event<reshade::addon_event::destroy_pipeline>(onDestroyPipeline);
