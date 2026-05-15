@@ -58,6 +58,7 @@
 #include <fstream>
 #include <sstream>
 #include <cctype>
+#include <cstdlib>
 
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -68,6 +69,7 @@ extern "C" __declspec(dllexport) const char *NAME = "Strawberry Shortcake";
 extern "C" __declspec(dllexport) const char *DESCRIPTION = "Add-on which allows you to define groups of game shaders to toggle on/off with one key press.";
 
 static constexpr uint32_t MAX_PS_SRV_SLOTS = 128;
+static constexpr uint32_t MAX_VS_SRV_SLOTS = 128;
 static constexpr uint32_t MAX_PS_CB_SLOTS = 32;
 static constexpr uint32_t MAX_VERTEX_BUFFER_SLOTS = 32;
 
@@ -78,6 +80,7 @@ struct __declspec(uuid("038B03AA-4C75-443B-A695-752D80797037")) CommandListDataC
 	uint64_t activeInputLayoutPipeline;
 	primitive_topology activeTopology;
     resource_view pixelSRVs[MAX_PS_SRV_SLOTS]; // current SRVs bound to the pixel-shader stage
+    resource_view vertexSRVs[MAX_VS_SRV_SLOTS]; // current SRVs bound to the vertex-shader stage
     buffer_range pixelCBs[MAX_PS_CB_SLOTS]; // current constant buffers bound to the pixel-shader stage
     pipeline_layout pixelCBLayouts[MAX_PS_CB_SLOTS];
     uint32_t pixelCBLayoutParams[MAX_PS_CB_SLOTS];
@@ -117,6 +120,7 @@ static KeyRepeatState g_keyRepeat[9]; // one per numpad 1-9
 
 // Texture-export state
 static std::vector<resource_view> g_lastHuntedPixelSRVs;
+static std::vector<resource_view> g_lastHuntedVertexSRVs;
 static std::vector<std::string>   g_exportResultLines;
 static bool                       g_showExportResult = false;
 
@@ -124,12 +128,14 @@ static bool                       g_showExportResult = false;
 struct PipelineInputLayoutInfo
 {
 	std::vector<input_element> elements;
+	std::vector<std::string> semanticNames;
 	primitive_topology topology = primitive_topology::undefined;
 };
 
 struct CapturedMeshDraw
 {
 	uint32_t shaderHash = 0;
+	uint32_t vertexShaderHash = 0;
 	bool indexed = false;
 	uint32_t vertexCount = 0;
 	uint32_t instanceCount = 0;
@@ -140,6 +146,7 @@ struct CapturedMeshDraw
 	int32_t vertexOffset = 0;
 	primitive_topology topology = primitive_topology::undefined;
 	std::vector<input_element> inputElements;
+	std::vector<std::string> inputSemanticNames;
 	resource vertexBuffers[MAX_VERTEX_BUFFER_SLOTS] = {};
 	uint64_t vertexBufferOffsets[MAX_VERTEX_BUFFER_SLOTS] = {};
 	uint32_t vertexBufferStrides[MAX_VERTEX_BUFFER_SLOTS] = {};
@@ -148,8 +155,39 @@ struct CapturedMeshDraw
 	uint32_t indexSize = 0;
 };
 
+struct MeshVertexOverride
+{
+	uint32_t shaderHash = 0;
+	bool indexed = false;
+	uint32_t vertexCount = 0;
+	uint32_t indexCount = 0;
+	uint32_t firstVertex = 0;
+	uint32_t firstIndex = 0;
+	int32_t vertexOffset = 0;
+	uint32_t firstInstance = 0;
+	uint32_t positionSlot = 0;
+	resource originalBuffer = {};
+	uint64_t replacementSize = 0;
+	uint32_t minVertex = 0;
+	uint32_t positionOffset = 0;
+	reshade::api::format positionFormat = reshade::api::format::unknown;
+	uint64_t vertexBufferOffset = 0;
+	uint32_t stride = 0;
+	std::vector<std::array<float, 3>> editedPositions;
+	resource replacement = {};
+};
+
+struct ObjDrawMesh
+{
+	std::vector<std::array<float, 3>> vertices;
+	std::vector<std::array<float, 2>> texcoords;
+	std::vector<uint32_t> faceVertexIndices;
+	std::vector<uint32_t> faceOriginalVertexIds;
+};
+
 static std::unordered_map<uint64_t, PipelineInputLayoutInfo> g_inputLayoutPipelines;
 static std::vector<CapturedMeshDraw> g_lastHuntedMeshDraws;
+static std::vector<MeshVertexOverride> g_meshVertexOverrides;
 
 // Pixel-shader constant-buffer editor state
 struct ShaderVariableInfo
@@ -496,6 +534,7 @@ static void onResetCommandList(command_list *commandList)
 	commandListData.activeInputLayoutPipeline = -1;
 	commandListData.activeTopology = primitive_topology::undefined;
 	memset(commandListData.pixelSRVs, 0, sizeof(commandListData.pixelSRVs));
+	memset(commandListData.vertexSRVs, 0, sizeof(commandListData.vertexSRVs));
 	memset(commandListData.pixelCBs, 0, sizeof(commandListData.pixelCBs));
 	memset(commandListData.pixelCBLayouts, 0, sizeof(commandListData.pixelCBLayouts));
 	memset(commandListData.pixelCBLayoutParams, 0, sizeof(commandListData.pixelCBLayoutParams));
@@ -540,6 +579,13 @@ static void onInitPipeline(device *device, pipeline_layout, uint32_t subobjectCo
 				{
 					const input_element* elements = static_cast<const input_element*>(subobjects[i].data);
 					layoutInfo.elements.assign(elements, elements + subobjects[i].count);
+					layoutInfo.semanticNames.clear();
+					layoutInfo.semanticNames.reserve(layoutInfo.elements.size());
+					for (input_element& element : layoutInfo.elements)
+					{
+						layoutInfo.semanticNames.emplace_back(element.semantic ? element.semantic : "");
+						element.semantic = layoutInfo.semanticNames.back().c_str();
+					}
 					hasInputLayout = true;
 				}
 				break;
@@ -1539,11 +1585,11 @@ static bool writePng(const std::string& path, uint32_t w, uint32_t h, const uint
 }
 
 // Export every unique 2D RGBA/BGRA texture currently bound to the hunted pixel shader.
-static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t shaderHash)
+static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t shaderHash, const std::vector<resource_view>& srvs, const char* filePrefix)
 {
 	std::vector<std::string> results;
 
-	if (g_lastHuntedPixelSRVs.empty())
+	if (srvs.empty())
 	{
 		results.push_back("Nothing to export - shader did not draw this frame.");
 		return results;
@@ -1559,7 +1605,7 @@ static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t
 	std::unordered_set<uint64_t> seen;
 	int n = 0;
 
-	for (const resource_view& srv : g_lastHuntedPixelSRVs)
+	for (const resource_view& srv : srvs)
 	{
 		if (!srv.handle) continue;
 
@@ -1605,7 +1651,7 @@ static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t
 			}
 			else
 			{
-				const std::string fname = "ps_" + toHexStr(shaderHash) + "_" + toHexStr(texHash) + ".png";
+				const std::string fname = std::string(filePrefix) + "_" + toHexStr(shaderHash) + "_" + toHexStr(texHash) + ".png";
 				if (writePng((exportDir / fname).string(), w, h, pixels.data()))
 					results.push_back(fname + "  (" + std::to_string(w) + "x" + std::to_string(h) + ")  exported.");
 				else
@@ -1630,8 +1676,21 @@ static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t
 static void onPushDescriptors(command_list* cmdList, shader_stage stages, pipeline_layout layout, uint32_t paramIdx,
                                const descriptor_set_update& update)
 {
-	if ((stages & shader_stage::pixel) != shader_stage::pixel) return;
 	if (update.count == 0 || !update.descriptors) return;
+
+	if ((stages & shader_stage::vertex) == shader_stage::vertex && update.type == descriptor_type::shader_resource_view)
+	{
+		const resource_view* views = static_cast<const resource_view*>(update.descriptors);
+		auto& data = cmdList->get_private_data<CommandListDataContainer>();
+		for (uint32_t i = 0; i < update.count; ++i)
+		{
+			const uint32_t slot = update.binding + i;
+			if (slot < MAX_VS_SRV_SLOTS)
+				data.vertexSRVs[slot] = views[i];
+		}
+	}
+
+	if ((stages & shader_stage::pixel) != shader_stage::pixel) return;
 
 	if (update.type == descriptor_type::constant_buffer)
 	{
@@ -1860,18 +1919,39 @@ static void onUnmapBufferRegion(device*, resource res)
 // If the draw call is using the currently hunted pixel shader, snapshot its SRVs.
 static void captureHuntedShaderSRVs(command_list* commandList)
 {
-	if (!g_pixelShaderManager.isInHuntingMode() || g_activeCollectorFrameCounter > 0) return;
-	const uint32_t huntedHash = g_pixelShaderManager.getActiveHuntedShaderHash();
-	if (!huntedHash) return;
+	if (g_activeCollectorFrameCounter > 0) return;
 
 	const CommandListDataContainer& data    = commandList->get_private_data<CommandListDataContainer>();
-	const uint32_t                  current = g_pixelShaderManager.getShaderHash(data.activePixelShaderPipeline);
-	if (current != huntedHash) return;
+	const uint32_t currentPixel = g_pixelShaderManager.getShaderHash(data.activePixelShaderPipeline);
+	const uint32_t currentVertex = g_vertexShaderManager.getShaderHash(data.activeVertexShaderPipeline);
 
-	// Accumulate across all draw calls this frame; deduplication happens at export time
-	for (uint32_t i = 0; i < MAX_PS_SRV_SLOTS; ++i)
-		if (data.pixelSRVs[i].handle)
-			g_lastHuntedPixelSRVs.push_back(data.pixelSRVs[i]);
+	const bool capturePixel = g_pixelShaderManager.isInHuntingMode()
+		&& g_pixelShaderManager.getActiveHuntedShaderHash() != 0
+		&& currentPixel == g_pixelShaderManager.getActiveHuntedShaderHash();
+	const bool captureVertex = g_vertexShaderManager.isInHuntingMode()
+		&& g_vertexShaderManager.getActiveHuntedShaderHash() != 0
+		&& currentVertex == g_vertexShaderManager.getActiveHuntedShaderHash();
+	if (!capturePixel && !captureVertex) return;
+
+	// Accumulate across all draw calls this frame; deduplication happens at export time.
+	if (capturePixel)
+	{
+		for (uint32_t i = 0; i < MAX_PS_SRV_SLOTS; ++i)
+			if (data.pixelSRVs[i].handle)
+				g_lastHuntedPixelSRVs.push_back(data.pixelSRVs[i]);
+	}
+	if (captureVertex)
+	{
+		for (uint32_t i = 0; i < MAX_VS_SRV_SLOTS; ++i)
+			if (data.vertexSRVs[i].handle)
+				g_lastHuntedVertexSRVs.push_back(data.vertexSRVs[i]);
+		for (uint32_t i = 0; i < MAX_PS_SRV_SLOTS; ++i)
+			if (data.pixelSRVs[i].handle)
+				g_lastHuntedVertexSRVs.push_back(data.pixelSRVs[i]);
+	}
+
+	if (!capturePixel)
+		return;
 
 	device* dev = g_device;
 	if (!dev)
@@ -2332,15 +2412,102 @@ static bool isFloatFormat(reshade::api::format fmt, uint32_t& components)
 	}
 }
 
+static bool isExportablePositionFormat(reshade::api::format fmt, uint32_t& components)
+{
+	if (isFloatFormat(fmt, components))
+		return components >= 3;
+
+	switch (fmt)
+	{
+		case reshade::api::format::r16g16b16a16_float:
+		case reshade::api::format::r16g16b16a16_snorm:
+		case reshade::api::format::r16g16b16a16_unorm:
+		case reshade::api::format::r16g16b16a16_sint:
+		case reshade::api::format::r16g16b16a16_uint:
+			components = 4;
+			return true;
+		default:
+			components = 0;
+			return false;
+	}
+}
+
 static bool readFloatVector(const std::vector<uint8_t>& bytes, uint64_t offset, reshade::api::format fmt, float out[4])
 {
 	uint32_t components = 0;
-	if (!isFloatFormat(fmt, components) || offset + components * sizeof(float) > bytes.size())
+	if (isFloatFormat(fmt, components))
+	{
+		if (offset + components * sizeof(float) > bytes.size())
+			return false;
+
+		const float* source = reinterpret_cast<const float*>(bytes.data() + offset);
+		for (uint32_t i = 0; i < 4; ++i)
+			out[i] = i < components ? source[i] : 0.0f;
+		return true;
+	}
+
+	switch (fmt)
+	{
+		case reshade::api::format::r16g16b16a16_float:
+			if (offset + sizeof(uint16_t) * 4 > bytes.size())
+				return false;
+			for (uint32_t i = 0; i < 4; ++i)
+				out[i] = halfToFloat(reinterpret_cast<const uint16_t*>(bytes.data() + offset)[i]);
+			return true;
+		case reshade::api::format::r16g16b16a16_snorm:
+			if (offset + sizeof(int16_t) * 4 > bytes.size())
+				return false;
+			for (uint32_t i = 0; i < 4; ++i)
+				out[i] = std::max(-1.0f, reinterpret_cast<const int16_t*>(bytes.data() + offset)[i] / 32767.0f);
+			return true;
+		case reshade::api::format::r16g16b16a16_unorm:
+			if (offset + sizeof(uint16_t) * 4 > bytes.size())
+				return false;
+			for (uint32_t i = 0; i < 4; ++i)
+				out[i] = reinterpret_cast<const uint16_t*>(bytes.data() + offset)[i] / 65535.0f;
+			return true;
+		case reshade::api::format::r16g16b16a16_sint:
+			if (offset + sizeof(int16_t) * 4 > bytes.size())
+				return false;
+			for (uint32_t i = 0; i < 4; ++i)
+				out[i] = static_cast<float>(reinterpret_cast<const int16_t*>(bytes.data() + offset)[i]);
+			return true;
+		case reshade::api::format::r16g16b16a16_uint:
+			if (offset + sizeof(uint16_t) * 4 > bytes.size())
+				return false;
+			for (uint32_t i = 0; i < 4; ++i)
+				out[i] = static_cast<float>(reinterpret_cast<const uint16_t*>(bytes.data() + offset)[i]);
+			return true;
+		default:
+			return false;
+	}
+}
+
+static std::array<float, 2> encodeObjIdentityUv(uint32_t localVertex)
+{
+	constexpr float base = 4096.0f;
+	return { (static_cast<float>(localVertex & 0xFFFu) + 0.5f) / base,
+	         (static_cast<float>((localVertex >> 12) & 0xFFFu) + 0.5f) / base };
+}
+
+static uint32_t decodeObjIdentityUv(const std::array<float, 2>& uv)
+{
+	constexpr float base = 4096.0f;
+	const uint32_t lo = static_cast<uint32_t>(std::max(0.0f, std::min(base - 1.0f, std::floor(uv[0] * base))));
+	const uint32_t hi = static_cast<uint32_t>(std::max(0.0f, std::min(base - 1.0f, std::floor(uv[1] * base))));
+	return lo | (hi << 12);
+}
+
+static bool writeFloatVector(std::vector<uint8_t>& bytes, uint64_t offset, reshade::api::format fmt, const std::array<float, 3>& value)
+{
+	uint32_t components = 0;
+	if (!isFloatFormat(fmt, components) || components < 3 || offset + components * sizeof(float) > bytes.size())
 		return false;
 
-	const float* source = reinterpret_cast<const float*>(bytes.data() + offset);
-	for (uint32_t i = 0; i < 4; ++i)
-		out[i] = i < components ? source[i] : 0.0f;
+	float* dest = reinterpret_cast<float*>(bytes.data() + offset);
+	dest[0] = value[0];
+	dest[1] = value[1];
+	dest[2] = value[2];
 	return true;
 }
 
@@ -2378,16 +2545,145 @@ static bool copyBufferBytes(effect_runtime* runtime, resource source, uint64_t o
 	return ok;
 }
 
+static void destroyMeshVertexOverrides(device* dev)
+{
+	if (!dev)
+		return;
+
+	for (MeshVertexOverride& ov : g_meshVertexOverrides)
+	{
+		if (ov.replacement.handle)
+			dev->destroy_resource(ov.replacement);
+	}
+	g_meshVertexOverrides.clear();
+}
+
+static const input_element* findPositionElement(const CapturedMeshDraw& draw)
+{
+	const input_element* fallback = nullptr;
+	for (const input_element& element : draw.inputElements)
+	{
+		if ((semanticEquals(element.semantic, "POSITION") || semanticEquals(element.semantic, "POS")) && element.instance_step_rate == 0)
+		{
+			uint32_t components = 0;
+			if (isExportablePositionFormat(element.format, components) && components >= 3)
+				return &element;
+		}
+
+		uint32_t components = 0;
+		if (!fallback
+		    && element.instance_step_rate == 0
+		    && element.buffer_binding < MAX_VERTEX_BUFFER_SLOTS
+		    && draw.vertexBuffers[element.buffer_binding].handle
+		    && isExportablePositionFormat(element.format, components)
+		    && components >= 3)
+		{
+			fallback = &element;
+		}
+	}
+	return fallback;
+}
+
+static void writeInputLayoutDiagnostics(std::ostream& meta, const CapturedMeshDraw& draw)
+{
+	meta << "Input layout elements: " << draw.inputElements.size() << "\n";
+	for (size_t i = 0; i < draw.inputElements.size(); ++i)
+	{
+		const input_element& element = draw.inputElements[i];
+		const uint32_t stride = element.buffer_binding < MAX_VERTEX_BUFFER_SLOTS
+			? (draw.vertexBufferStrides[element.buffer_binding] ? draw.vertexBufferStrides[element.buffer_binding] : element.stride)
+			: element.stride;
+		meta << "  [" << i << "] semantic '" << (element.semantic ? element.semantic : "")
+		     << "' index " << element.semantic_index
+		     << ", location " << element.location
+		     << ", format " << static_cast<uint32_t>(element.format)
+		     << ", slot " << element.buffer_binding
+		     << ", offset " << element.offset
+		     << ", stride " << stride
+		     << ", step " << element.instance_step_rate
+		     << ", buffer " << (element.buffer_binding < MAX_VERTEX_BUFFER_SLOTS && draw.vertexBuffers[element.buffer_binding].handle ? "yes" : "no")
+		     << "\n";
+	}
+}
+
+static bool resolveMeshDrawVertexRange(const CapturedMeshDraw& draw, const input_element* posElement, uint32_t& minVertex, uint32_t& maxVertex, std::vector<uint32_t>* outIndices, effect_runtime* runtime, std::ostream* meta)
+{
+	if (!posElement || posElement->buffer_binding >= MAX_VERTEX_BUFFER_SLOTS || !draw.vertexBuffers[posElement->buffer_binding].handle)
+	{
+		if (meta) *meta << "no usable per-vertex position input found.\n";
+		return false;
+	}
+
+	if (draw.indexed)
+	{
+		if (!draw.indexBuffer.handle || (draw.indexSize != 2 && draw.indexSize != 4))
+		{
+			if (meta) *meta << "unsupported or missing index buffer.\n";
+			return false;
+		}
+
+		std::vector<uint8_t> indexBytes;
+		const uint64_t indexOffset = draw.indexBufferOffset + static_cast<uint64_t>(draw.firstIndex) * draw.indexSize;
+		const uint64_t indexBytesSize = static_cast<uint64_t>(draw.indexCount) * draw.indexSize;
+		if (!copyBufferBytes(runtime, draw.indexBuffer, indexOffset, indexBytesSize, indexBytes))
+		{
+			if (meta) *meta << "could not read index buffer.\n";
+			return false;
+		}
+
+		minVertex = UINT32_MAX;
+		maxVertex = 0;
+		if (outIndices) outIndices->resize(draw.indexCount);
+		for (uint32_t i = 0; i < draw.indexCount; ++i)
+		{
+			uint32_t idx = draw.indexSize == 2
+				? static_cast<uint32_t>(reinterpret_cast<const uint16_t*>(indexBytes.data())[i])
+				: reinterpret_cast<const uint32_t*>(indexBytes.data())[i];
+			const int64_t adjusted = static_cast<int64_t>(idx) + draw.vertexOffset;
+			if (adjusted < 0)
+				continue;
+			idx = static_cast<uint32_t>(adjusted);
+			if (outIndices) (*outIndices)[i] = idx;
+			minVertex = std::min(minVertex, idx);
+			maxVertex = std::max(maxVertex, idx);
+		}
+	}
+	else
+	{
+		if (draw.vertexCount == 0)
+		{
+			if (meta) *meta << "empty non-indexed draw.\n";
+			return false;
+		}
+		minVertex = draw.firstVertex;
+		maxVertex = draw.firstVertex + draw.vertexCount - 1;
+	}
+
+	if (minVertex > maxVertex)
+	{
+		if (meta) *meta << "empty vertex range.\n";
+		return false;
+	}
+	return true;
+}
+
 static void captureHuntedMeshDraw(command_list* commandList, bool indexed, uint32_t vertexCount, uint32_t instanceCount,
                                   uint32_t firstVertex, uint32_t firstInstance, uint32_t indexCount,
                                   uint32_t firstIndex, int32_t vertexOffset)
 {
-	if (!commandList || !g_pixelShaderManager.isInHuntingMode() || g_activeCollectorFrameCounter > 0)
+	if (!commandList || g_activeCollectorFrameCounter > 0)
 		return;
 
 	const CommandListDataContainer& data = commandList->get_private_data<CommandListDataContainer>();
-	const uint32_t shaderHash = g_pixelShaderManager.getShaderHash(data.activePixelShaderPipeline);
-	if (!shaderHash || shaderHash != g_pixelShaderManager.getActiveHuntedShaderHash())
+	const uint32_t pixelShaderHash = g_pixelShaderManager.getShaderHash(data.activePixelShaderPipeline);
+	const uint32_t vertexShaderHash = g_vertexShaderManager.getShaderHash(data.activeVertexShaderPipeline);
+	const bool capturePixel = g_pixelShaderManager.isInHuntingMode()
+		&& g_pixelShaderManager.getActiveHuntedShaderHash() != 0
+		&& pixelShaderHash == g_pixelShaderManager.getActiveHuntedShaderHash();
+	const bool captureVertex = g_vertexShaderManager.isInHuntingMode()
+		&& g_vertexShaderManager.getActiveHuntedShaderHash() != 0
+		&& vertexShaderHash == g_vertexShaderManager.getActiveHuntedShaderHash();
+	if (!capturePixel && !captureVertex)
 		return;
 
 	const auto layoutIt = g_inputLayoutPipelines.find(data.activeInputLayoutPipeline);
@@ -2398,7 +2694,8 @@ static void captureHuntedMeshDraw(command_list* commandList, bool indexed, uint3
 		return;
 
 	CapturedMeshDraw draw;
-	draw.shaderHash = shaderHash;
+	draw.shaderHash = pixelShaderHash;
+	draw.vertexShaderHash = vertexShaderHash;
 	draw.indexed = indexed;
 	draw.vertexCount = vertexCount;
 	draw.instanceCount = instanceCount;
@@ -2428,6 +2725,9 @@ static void captureHuntedMeshDraw(command_list* commandList, bool indexed, uint3
 	if (draw.topology == primitive_topology::undefined)
 		draw.topology = primitive_topology::triangle_list;
 	draw.inputElements = layoutIt->second.elements;
+	draw.inputSemanticNames = layoutIt->second.semanticNames;
+	for (size_t i = 0; i < draw.inputElements.size(); ++i)
+		draw.inputElements[i].semantic = i < draw.inputSemanticNames.size() ? draw.inputSemanticNames[i].c_str() : "";
 	memcpy(draw.vertexBuffers, data.vertexBuffers, sizeof(draw.vertexBuffers));
 	memcpy(draw.vertexBufferOffsets, data.vertexBufferOffsets, sizeof(draw.vertexBufferOffsets));
 	memcpy(draw.vertexBufferStrides, data.vertexBufferStrides, sizeof(draw.vertexBufferStrides));
@@ -2437,7 +2737,7 @@ static void captureHuntedMeshDraw(command_list* commandList, bool indexed, uint3
 	g_lastHuntedMeshDraws.push_back(std::move(draw));
 }
 
-static std::vector<std::string> exportMeshes(effect_runtime* runtime, uint32_t shaderHash)
+static std::vector<std::string> exportMeshes(effect_runtime* runtime, uint32_t shaderHash, bool vertexShaderExport)
 {
 	std::vector<std::string> results;
 	if (g_lastHuntedMeshDraws.empty())
@@ -2449,7 +2749,8 @@ static std::vector<std::string> exportMeshes(effect_runtime* runtime, uint32_t s
 	const std::filesystem::path exportDir = std::filesystem::path(g_iniFileName).parent_path() / "shortcake";
 	std::filesystem::create_directories(exportDir);
 
-	const std::string baseName = "mesh_ps_" + toHexStr(shaderHash) + "_" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+	const char* shaderPrefix = vertexShaderExport ? "vs" : "ps";
+	const std::string baseName = std::string("mesh_") + shaderPrefix + "_" + toHexStr(shaderHash) + "_" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 	const std::filesystem::path objPath = exportDir / (baseName + ".obj");
 	const std::filesystem::path metaPath = exportDir / (baseName + ".txt");
 	std::ofstream obj(objPath);
@@ -2460,18 +2761,21 @@ static std::vector<std::string> exportMeshes(effect_runtime* runtime, uint32_t s
 		return results;
 	}
 
-	obj << "# Strawberry Shortcake mesh export for pixel shader 0x" << toHexStr(shaderHash) << "\n";
+	obj << "# Strawberry Shortcake mesh export for " << (vertexShaderExport ? "vertex" : "pixel") << " shader 0x" << toHexStr(shaderHash) << "\n";
+	obj << "# UVs encode original vertex identity for Blender-safe reimport. Do not edit/remove UVs before Ctrl+Numpad .\n";
 	meta << "Captured draw candidates: " << g_lastHuntedMeshDraws.size() << "\n";
 	size_t vertexBase = 1;
+	size_t texcoordBase = 1;
 	size_t writtenDraws = 0;
 	size_t skippedDraws = 0;
 
 	for (size_t drawIndex = 0; drawIndex < g_lastHuntedMeshDraws.size(); ++drawIndex)
 	{
 		const CapturedMeshDraw& draw = g_lastHuntedMeshDraws[drawIndex];
-		if (draw.shaderHash != shaderHash)
+		const uint32_t drawShaderHash = vertexShaderExport ? draw.vertexShaderHash : draw.shaderHash;
+		if (drawShaderHash != shaderHash)
 		{
-			meta << "Skipped draw " << drawIndex << ": shader mismatch 0x" << toHexStr(draw.shaderHash) << "\n";
+			meta << "Skipped draw " << drawIndex << ": shader mismatch 0x" << toHexStr(drawShaderHash) << "\n";
 			continue;
 		}
 		if (draw.topology != primitive_topology::triangle_list && draw.topology != primitive_topology::triangle_strip)
@@ -2481,27 +2785,25 @@ static std::vector<std::string> exportMeshes(effect_runtime* runtime, uint32_t s
 			continue;
 		}
 
-		const input_element* posElement = nullptr;
-		for (const input_element& element : draw.inputElements)
-		{
-			if ((semanticEquals(element.semantic, "POSITION") || semanticEquals(element.semantic, "POS")) && element.instance_step_rate == 0)
-			{
-				uint32_t components = 0;
-				if (isFloatFormat(element.format, components) && components >= 3)
-				{
-					posElement = &element;
-					break;
-				}
-			}
-		}
+		const input_element* posElement = findPositionElement(draw);
 		if (!posElement || posElement->buffer_binding >= MAX_VERTEX_BUFFER_SLOTS || !draw.vertexBuffers[posElement->buffer_binding].handle)
 		{
 			++skippedDraws;
-			meta << "Skipped draw " << drawIndex << ": no float3/float4 POSITION input found.\n";
+			meta << "Skipped draw " << drawIndex << ": no usable per-vertex position input found.\n";
+			writeInputLayoutDiagnostics(meta, draw);
 			continue;
 		}
+		if (!semanticEquals(posElement->semantic, "POSITION") && !semanticEquals(posElement->semantic, "POS"))
+		{
+			meta << "Draw " << drawIndex << ": using fallback position input semantic '"
+			     << (posElement->semantic ? posElement->semantic : "")
+			     << "' index " << posElement->semantic_index
+			     << ", format " << static_cast<uint32_t>(posElement->format)
+			     << ", slot " << posElement->buffer_binding
+			     << ", offset " << posElement->offset << ".\n";
+		}
 
-		uint32_t stride = posElement->stride ? posElement->stride : draw.vertexBufferStrides[posElement->buffer_binding];
+		uint32_t stride = draw.vertexBufferStrides[posElement->buffer_binding] ? draw.vertexBufferStrides[posElement->buffer_binding] : posElement->stride;
 		if (stride == 0)
 		{
 			++skippedDraws;
@@ -2573,10 +2875,26 @@ static std::vector<std::string> exportMeshes(effect_runtime* runtime, uint32_t s
 				pos[0] = pos[1] = pos[2] = 0.0f;
 			obj << "v " << pos[0] << " " << pos[1] << " " << pos[2] << "\n";
 		}
+		for (uint32_t v = minVertex; v <= maxVertex; ++v)
+		{
+			const auto uv = encodeObjIdentityUv(v - minVertex);
+			obj << "vt " << uv[0] << " " << uv[1] << "\n";
+		}
 
 		auto objIndex = [&](uint32_t vertex) -> size_t
 		{
 			return vertexBase + static_cast<size_t>(vertex - minVertex);
+		};
+		auto objTexIndex = [&](uint32_t vertex) -> size_t
+		{
+			return texcoordBase + static_cast<size_t>(vertex - minVertex);
+		};
+		auto writeFace = [&](uint32_t a, uint32_t b, uint32_t c)
+		{
+			obj << "f "
+			    << objIndex(a) << "/" << objTexIndex(a) << " "
+			    << objIndex(b) << "/" << objTexIndex(b) << " "
+			    << objIndex(c) << "/" << objTexIndex(c) << "\n";
 		};
 
 		if (draw.indexed)
@@ -2584,7 +2902,7 @@ static std::vector<std::string> exportMeshes(effect_runtime* runtime, uint32_t s
 			if (draw.topology == primitive_topology::triangle_list)
 			{
 				for (uint32_t i = 0; i + 2 < indices.size(); i += 3)
-					obj << "f " << objIndex(indices[i + 0]) << " " << objIndex(indices[i + 1]) << " " << objIndex(indices[i + 2]) << "\n";
+					writeFace(indices[i + 0], indices[i + 1], indices[i + 2]);
 			}
 			else
 			{
@@ -2593,9 +2911,9 @@ static std::vector<std::string> exportMeshes(effect_runtime* runtime, uint32_t s
 					const uint32_t a = indices[i + 0], b = indices[i + 1], c = indices[i + 2];
 					if (a == b || b == c || a == c) continue;
 					if ((i & 1) == 0)
-						obj << "f " << objIndex(a) << " " << objIndex(b) << " " << objIndex(c) << "\n";
+						writeFace(a, b, c);
 					else
-						obj << "f " << objIndex(b) << " " << objIndex(a) << " " << objIndex(c) << "\n";
+						writeFace(b, a, c);
 				}
 			}
 		}
@@ -2604,7 +2922,7 @@ static std::vector<std::string> exportMeshes(effect_runtime* runtime, uint32_t s
 			if (draw.topology == primitive_topology::triangle_list)
 			{
 				for (uint32_t i = 0; i + 2 < draw.vertexCount; i += 3)
-					obj << "f " << objIndex(draw.firstVertex + i + 0) << " " << objIndex(draw.firstVertex + i + 1) << " " << objIndex(draw.firstVertex + i + 2) << "\n";
+					writeFace(draw.firstVertex + i + 0, draw.firstVertex + i + 1, draw.firstVertex + i + 2);
 			}
 			else
 			{
@@ -2612,14 +2930,15 @@ static std::vector<std::string> exportMeshes(effect_runtime* runtime, uint32_t s
 				{
 					const uint32_t a = draw.firstVertex + i + 0, b = draw.firstVertex + i + 1, c = draw.firstVertex + i + 2;
 					if ((i & 1) == 0)
-						obj << "f " << objIndex(a) << " " << objIndex(b) << " " << objIndex(c) << "\n";
+						writeFace(a, b, c);
 					else
-						obj << "f " << objIndex(b) << " " << objIndex(a) << " " << objIndex(c) << "\n";
+						writeFace(b, a, c);
 				}
 			}
 		}
 
 		vertexBase += static_cast<size_t>(maxVertex - minVertex + 1);
+		texcoordBase += static_cast<size_t>(maxVertex - minVertex + 1);
 		++writtenDraws;
 		meta << "Exported draw " << drawIndex << ": vertices " << minVertex << "-" << maxVertex
 		     << ", topology " << static_cast<uint32_t>(draw.topology)
@@ -2638,11 +2957,491 @@ static std::vector<std::string> exportMeshes(effect_runtime* runtime, uint32_t s
 	return results;
 }
 
+static int parseObjVertexIndexToken(const std::string& token)
+{
+	const size_t slash = token.find('/');
+	const std::string indexText = slash == std::string::npos ? token : token.substr(0, slash);
+	return std::atoi(indexText.c_str());
+}
+
+static int parseObjTexcoordIndexToken(const std::string& token)
+{
+	const size_t firstSlash = token.find('/');
+	if (firstSlash == std::string::npos)
+		return 0;
+	const size_t secondSlash = token.find('/', firstSlash + 1);
+	const std::string indexText = secondSlash == std::string::npos
+		? token.substr(firstSlash + 1)
+		: token.substr(firstSlash + 1, secondSlash - firstSlash - 1);
+	return indexText.empty() ? 0 : std::atoi(indexText.c_str());
+}
+
+static bool parseObjDrawMeshes(const std::filesystem::path& objPath, std::unordered_map<size_t, ObjDrawMesh>& outDrawMeshes)
+{
+	std::ifstream file(objPath);
+	if (!file)
+		return false;
+
+	size_t currentDraw = SIZE_MAX;
+	size_t currentDrawGlobalVertexBase = 0;
+	size_t currentDrawGlobalTexcoordBase = 0;
+	size_t globalVertexCount = 0;
+	size_t globalTexcoordCount = 0;
+	std::string line;
+	while (std::getline(file, line))
+	{
+		if (line.rfind("o draw_", 0) == 0 || line.rfind("g draw_", 0) == 0)
+		{
+			const size_t marker = line.find("draw_");
+			currentDraw = marker == std::string::npos ? SIZE_MAX : static_cast<size_t>(std::strtoull(line.c_str() + marker + 5, nullptr, 10));
+			if (currentDraw != SIZE_MAX)
+			{
+				outDrawMeshes[currentDraw];
+				currentDrawGlobalVertexBase = globalVertexCount;
+				currentDrawGlobalTexcoordBase = globalTexcoordCount;
+			}
+			continue;
+		}
+
+		if (line.rfind("v ", 0) == 0)
+		{
+			if (currentDraw == SIZE_MAX)
+				currentDraw = 0;
+
+			std::istringstream stream(line.substr(2));
+			std::array<float, 3> pos = {};
+			if (stream >> pos[0] >> pos[1] >> pos[2])
+			{
+				outDrawMeshes[currentDraw].vertices.push_back(pos);
+				++globalVertexCount;
+			}
+			continue;
+		}
+
+		if (line.rfind("vt ", 0) == 0)
+		{
+			if (currentDraw == SIZE_MAX)
+				currentDraw = 0;
+
+			std::istringstream stream(line.substr(3));
+			std::array<float, 2> uv = {};
+			if (stream >> uv[0] >> uv[1])
+			{
+				outDrawMeshes[currentDraw].texcoords.push_back(uv);
+				++globalTexcoordCount;
+			}
+			continue;
+		}
+
+		if (line.rfind("f ", 0) == 0)
+		{
+			if (currentDraw == SIZE_MAX)
+				currentDraw = 0;
+
+			std::istringstream stream(line.substr(2));
+			std::vector<uint32_t> face;
+			std::string token;
+			while (stream >> token)
+			{
+				const int objIndex = parseObjVertexIndexToken(token);
+				if (objIndex <= 0)
+					continue;
+
+				const size_t globalIndex = static_cast<size_t>(objIndex - 1);
+				if (globalIndex < currentDrawGlobalVertexBase)
+					continue;
+
+				const size_t localIndex = globalIndex - currentDrawGlobalVertexBase;
+				if (localIndex < outDrawMeshes[currentDraw].vertices.size())
+				{
+					face.push_back(static_cast<uint32_t>(localIndex));
+
+					const int texIndex = parseObjTexcoordIndexToken(token);
+					if (texIndex > 0)
+					{
+						const size_t globalTexIndex = static_cast<size_t>(texIndex - 1);
+						if (globalTexIndex >= currentDrawGlobalTexcoordBase)
+						{
+							const size_t localTexIndex = globalTexIndex - currentDrawGlobalTexcoordBase;
+							if (localTexIndex < outDrawMeshes[currentDraw].texcoords.size())
+								outDrawMeshes[currentDraw].faceOriginalVertexIds.push_back(decodeObjIdentityUv(outDrawMeshes[currentDraw].texcoords[localTexIndex]));
+							else
+								outDrawMeshes[currentDraw].faceOriginalVertexIds.push_back(UINT32_MAX);
+						}
+						else
+						{
+							outDrawMeshes[currentDraw].faceOriginalVertexIds.push_back(UINT32_MAX);
+						}
+					}
+					else
+					{
+						outDrawMeshes[currentDraw].faceOriginalVertexIds.push_back(UINT32_MAX);
+					}
+				}
+			}
+
+			if (face.size() >= 3)
+			{
+				const size_t identityStart = outDrawMeshes[currentDraw].faceOriginalVertexIds.size() >= face.size()
+					? outDrawMeshes[currentDraw].faceOriginalVertexIds.size() - face.size()
+					: SIZE_MAX;
+				std::vector<uint32_t> identities;
+				if (identityStart != SIZE_MAX)
+					identities.assign(outDrawMeshes[currentDraw].faceOriginalVertexIds.begin() + identityStart, outDrawMeshes[currentDraw].faceOriginalVertexIds.end());
+				if (identityStart != SIZE_MAX)
+					outDrawMeshes[currentDraw].faceOriginalVertexIds.resize(identityStart);
+
+				for (size_t i = 1; i + 1 < face.size(); ++i)
+				{
+					outDrawMeshes[currentDraw].faceVertexIndices.push_back(face[0]);
+					outDrawMeshes[currentDraw].faceVertexIndices.push_back(face[i]);
+					outDrawMeshes[currentDraw].faceVertexIndices.push_back(face[i + 1]);
+					if (identities.size() == face.size())
+					{
+						outDrawMeshes[currentDraw].faceOriginalVertexIds.push_back(identities[0]);
+						outDrawMeshes[currentDraw].faceOriginalVertexIds.push_back(identities[i]);
+						outDrawMeshes[currentDraw].faceOriginalVertexIds.push_back(identities[i + 1]);
+					}
+				}
+			}
+		}
+	}
+	return !outDrawMeshes.empty();
+}
+
+static std::filesystem::path findNewestMeshObjForShader(uint32_t shaderHash)
+{
+	const std::filesystem::path exportDir = std::filesystem::path(g_iniFileName).parent_path() / "shortcake";
+	const std::string prefix = "mesh_ps_" + toHexStr(shaderHash) + "_";
+	std::filesystem::path newest;
+	std::filesystem::file_time_type newestTime = std::filesystem::file_time_type::min();
+
+	if (!std::filesystem::exists(exportDir))
+		return newest;
+
+	for (const auto& entry : std::filesystem::directory_iterator(exportDir))
+	{
+		if (!entry.is_regular_file() || entry.path().extension() != ".obj")
+			continue;
+		const std::string name = entry.path().filename().string();
+		if (name.rfind(prefix, 0) != 0)
+			continue;
+
+		const auto writeTime = entry.last_write_time();
+		if (newest.empty() || writeTime > newestTime)
+		{
+			newest = entry.path();
+			newestTime = writeTime;
+		}
+	}
+	return newest;
+}
+
+static std::vector<std::string> importMeshOverrides(effect_runtime* runtime, uint32_t shaderHash)
+{
+	std::vector<std::string> results;
+	if (g_lastHuntedMeshDraws.empty())
+	{
+		results.push_back("Nothing to import - shader did not draw this frame.");
+		return results;
+	}
+
+	device* dev = runtime ? runtime->get_command_queue()->get_device() : nullptr;
+	if (!dev)
+	{
+		results.push_back("Mesh import failed: no device.");
+		return results;
+	}
+
+	const std::filesystem::path objPath = findNewestMeshObjForShader(shaderHash);
+	if (objPath.empty())
+	{
+		results.push_back("No mesh_ps_" + toHexStr(shaderHash) + "_*.obj found.");
+		return results;
+	}
+
+	std::unordered_map<size_t, ObjDrawMesh> objDrawMeshes;
+	if (!parseObjDrawMeshes(objPath, objDrawMeshes))
+	{
+		results.push_back(objPath.filename().string() + ": OBJ parse failed.");
+		return results;
+	}
+
+	destroyMeshVertexOverrides(dev);
+
+	size_t imported = 0;
+	size_t skipped = 0;
+	for (const auto& [drawIndex, editedMesh] : objDrawMeshes)
+	{
+		if (drawIndex >= g_lastHuntedMeshDraws.size())
+		{
+			++skipped;
+			continue;
+		}
+
+		const CapturedMeshDraw& draw = g_lastHuntedMeshDraws[drawIndex];
+		if (draw.shaderHash != shaderHash || (draw.topology != primitive_topology::triangle_list && draw.topology != primitive_topology::triangle_strip))
+		{
+			++skipped;
+			continue;
+		}
+
+		const input_element* posElement = findPositionElement(draw);
+		uint32_t stride = posElement ? (draw.vertexBufferStrides[posElement->buffer_binding] ? draw.vertexBufferStrides[posElement->buffer_binding] : posElement->stride) : 0;
+		if (!posElement || stride == 0)
+		{
+			++skipped;
+			continue;
+		}
+
+		uint32_t minVertex = 0, maxVertex = 0;
+		if (!resolveMeshDrawVertexRange(draw, posElement, minVertex, maxVertex, nullptr, runtime, nullptr))
+		{
+			++skipped;
+			continue;
+		}
+
+		const uint32_t exportedVertexCount = maxVertex - minVertex + 1;
+		if (editedMesh.vertices.size() != exportedVertexCount)
+		{
+			results.push_back("draw_" + std::to_string(drawIndex) + ": vertex count mismatch (" + std::to_string(editedMesh.vertices.size()) + " vs " + std::to_string(exportedVertexCount) + ").");
+			++skipped;
+			continue;
+		}
+
+		const resource sourceVertexBuffer = draw.vertexBuffers[posElement->buffer_binding];
+		const resource_desc sourceDesc = dev->get_resource_desc(sourceVertexBuffer);
+		const uint64_t replacementSize = sourceDesc.type == resource_type::buffer ? sourceDesc.buffer.size : 0;
+		if (replacementSize == 0 || replacementSize > 128ull * 1024ull * 1024ull)
+		{
+			++skipped;
+			continue;
+		}
+
+		std::vector<uint8_t> replacementBytes;
+		if (!copyBufferBytes(runtime, sourceVertexBuffer, 0, replacementSize, replacementBytes))
+		{
+			++skipped;
+			continue;
+		}
+
+		std::vector<std::array<float, 3>> remappedVertices(exportedVertexCount);
+		std::vector<uint32_t> remapHits(exportedVertexCount, 0);
+		if (!editedMesh.faceVertexIndices.empty())
+		{
+			if (editedMesh.faceOriginalVertexIds.size() == editedMesh.faceVertexIndices.size())
+			{
+				for (size_t i = 0; i < editedMesh.faceVertexIndices.size(); ++i)
+				{
+					const uint32_t originalLocalVertex = editedMesh.faceOriginalVertexIds[i];
+					const uint32_t editedLocalVertex = editedMesh.faceVertexIndices[i];
+					if (originalLocalVertex >= exportedVertexCount || editedLocalVertex >= editedMesh.vertices.size())
+						continue;
+
+					remappedVertices[originalLocalVertex] = editedMesh.vertices[editedLocalVertex];
+					++remapHits[originalLocalVertex];
+				}
+			}
+			else
+			{
+				std::vector<uint32_t> originalFaceVertices;
+				if (draw.indexed)
+				{
+					std::vector<uint32_t> indices;
+					if (resolveMeshDrawVertexRange(draw, posElement, minVertex, maxVertex, &indices, runtime, nullptr))
+					{
+						if (draw.topology == primitive_topology::triangle_list)
+						{
+							for (uint32_t i = 0; i + 2 < indices.size(); i += 3)
+							{
+								originalFaceVertices.push_back(indices[i + 0] - minVertex);
+								originalFaceVertices.push_back(indices[i + 1] - minVertex);
+								originalFaceVertices.push_back(indices[i + 2] - minVertex);
+							}
+						}
+						else
+						{
+							for (uint32_t i = 0; i + 2 < indices.size(); ++i)
+							{
+								const uint32_t a = indices[i + 0] - minVertex;
+								const uint32_t b = indices[i + 1] - minVertex;
+								const uint32_t c = indices[i + 2] - minVertex;
+								if (a == b || b == c || a == c) continue;
+								if ((i & 1) == 0)
+								{
+									originalFaceVertices.push_back(a);
+									originalFaceVertices.push_back(b);
+									originalFaceVertices.push_back(c);
+								}
+								else
+								{
+									originalFaceVertices.push_back(b);
+									originalFaceVertices.push_back(a);
+									originalFaceVertices.push_back(c);
+								}
+							}
+						}
+					}
+				}
+				else
+				{
+					if (draw.topology == primitive_topology::triangle_list)
+					{
+						for (uint32_t i = 0; i + 2 < draw.vertexCount; i += 3)
+						{
+							originalFaceVertices.push_back(i + 0);
+							originalFaceVertices.push_back(i + 1);
+							originalFaceVertices.push_back(i + 2);
+						}
+					}
+					else
+					{
+						for (uint32_t i = 0; i + 2 < draw.vertexCount; ++i)
+						{
+							if ((i & 1) == 0)
+							{
+								originalFaceVertices.push_back(i + 0);
+								originalFaceVertices.push_back(i + 1);
+								originalFaceVertices.push_back(i + 2);
+							}
+							else
+							{
+								originalFaceVertices.push_back(i + 1);
+								originalFaceVertices.push_back(i + 0);
+								originalFaceVertices.push_back(i + 2);
+							}
+						}
+					}
+				}
+
+				const size_t pairCount = std::min(originalFaceVertices.size(), editedMesh.faceVertexIndices.size());
+				for (size_t i = 0; i < pairCount; ++i)
+				{
+					const uint32_t originalLocalVertex = originalFaceVertices[i];
+					const uint32_t editedLocalVertex = editedMesh.faceVertexIndices[i];
+					if (originalLocalVertex >= exportedVertexCount || editedLocalVertex >= editedMesh.vertices.size())
+						continue;
+
+					remappedVertices[originalLocalVertex] = editedMesh.vertices[editedLocalVertex];
+					++remapHits[originalLocalVertex];
+				}
+			}
+		}
+
+		for (uint32_t i = 0; i < exportedVertexCount; ++i)
+			if (remapHits[i] == 0)
+				remappedVertices[i] = editedMesh.vertices[i];
+
+		for (uint32_t i = 0; i < exportedVertexCount; ++i)
+		{
+			const uint32_t vertexIndex = minVertex + i;
+			const uint64_t localOffset = draw.vertexBufferOffsets[posElement->buffer_binding] + static_cast<uint64_t>(vertexIndex) * stride + posElement->offset;
+			writeFloatVector(replacementBytes, localOffset, posElement->format, remappedVertices[i]);
+		}
+
+		resource replacement = {};
+		subresource_data initial = {};
+		initial.data = replacementBytes.data();
+		const resource_desc desc(static_cast<uint64_t>(replacementBytes.size()), memory_heap::gpu_only, resource_usage::vertex_buffer | resource_usage::copy_dest);
+		if (!dev->create_resource(desc, &initial, resource_usage::vertex_buffer, &replacement))
+		{
+			++skipped;
+			continue;
+		}
+
+		MeshVertexOverride ov;
+		ov.shaderHash = shaderHash;
+		ov.indexed = draw.indexed;
+		ov.vertexCount = draw.vertexCount;
+		ov.indexCount = draw.indexCount;
+		ov.firstVertex = draw.firstVertex;
+		ov.firstIndex = draw.firstIndex;
+		ov.vertexOffset = draw.vertexOffset;
+		ov.firstInstance = draw.firstInstance;
+		ov.positionSlot = posElement->buffer_binding;
+		ov.originalBuffer = sourceVertexBuffer;
+		ov.replacementSize = replacementSize;
+		ov.minVertex = minVertex;
+		ov.positionOffset = posElement->offset;
+		ov.positionFormat = posElement->format;
+		ov.vertexBufferOffset = draw.vertexBufferOffsets[posElement->buffer_binding];
+		ov.stride = stride;
+		ov.editedPositions = std::move(remappedVertices);
+		ov.replacement = replacement;
+		g_meshVertexOverrides.push_back(ov);
+		++imported;
+	}
+
+	results.push_back(objPath.filename().string() + " imported.");
+	results.push_back(std::to_string(imported) + " draw override(s), " + std::to_string(skipped) + " skipped.");
+	return results;
+}
+
+static void applyMeshOverridesForDraw(command_list* commandList, bool indexed, uint32_t vertexCount, uint32_t firstVertex,
+                                      uint32_t indexCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
+{
+	if (!commandList || g_meshVertexOverrides.empty())
+		return;
+
+	const CommandListDataContainer& data = commandList->get_private_data<CommandListDataContainer>();
+	const uint32_t shaderHash = g_pixelShaderManager.getShaderHash(data.activePixelShaderPipeline);
+	if (!shaderHash)
+		return;
+
+	ID3D11DeviceContext* d3d11Context = reinterpret_cast<ID3D11DeviceContext*>(commandList->get_native());
+		if (!d3d11Context)
+		return;
+
+	for (const MeshVertexOverride& ov : g_meshVertexOverrides)
+	{
+		if (ov.shaderHash != shaderHash || ov.indexed != indexed || ov.firstInstance != firstInstance || !ov.replacement.handle)
+			continue;
+		if (indexed)
+		{
+			if (ov.indexCount != indexCount || ov.firstIndex != firstIndex || ov.vertexOffset != vertexOffset)
+				continue;
+		}
+		else
+		{
+			if (ov.vertexCount != vertexCount || ov.firstVertex != firstVertex)
+				continue;
+		}
+
+		ID3D11Buffer* buffer = reinterpret_cast<ID3D11Buffer*>(ov.replacement.handle);
+		ID3D11Buffer* originalBuffer = reinterpret_cast<ID3D11Buffer*>(ov.originalBuffer.handle);
+		if (buffer && originalBuffer)
+		{
+			d3d11Context->CopyResource(buffer, originalBuffer);
+			for (uint32_t i = 0; i < ov.editedPositions.size(); ++i)
+			{
+				const uint64_t byteOffset = ov.vertexBufferOffset + static_cast<uint64_t>(ov.minVertex + i) * ov.stride + ov.positionOffset;
+				if (byteOffset + sizeof(float) * 3 > ov.replacementSize)
+					continue;
+
+				const D3D11_BOX box = {
+					static_cast<UINT>(byteOffset),
+					0,
+					0,
+					static_cast<UINT>(byteOffset + sizeof(float) * 3),
+					1,
+					1
+				};
+				d3d11Context->UpdateSubresource(buffer, 0, &box, ov.editedPositions[i].data(), 0, 0);
+			}
+		}
+
+		UINT stride = ov.stride;
+		UINT offset = static_cast<UINT>(ov.vertexBufferOffset);
+		d3d11Context->IASetVertexBuffers(ov.positionSlot, 1, &buffer, &stride, &offset);
+	}
+}
+
 
 static bool onDraw(command_list* commandList, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance)
 {
 	captureHuntedShaderSRVs(commandList);
 	captureHuntedMeshDraw(commandList, false, vertex_count, instance_count, first_vertex, first_instance, 0, 0, 0);
+	applyMeshOverridesForDraw(commandList, false, vertex_count, first_vertex, 0, 0, 0, first_instance);
 	applyPixelConstantBufferOverridesForDraw(commandList);
 	return blockDrawCallForCommandList(commandList);
 }
@@ -2652,6 +3451,7 @@ static bool onDrawIndexed(command_list* commandList, uint32_t index_count, uint3
 {
 	captureHuntedShaderSRVs(commandList);
 	captureHuntedMeshDraw(commandList, true, 0, instance_count, 0, first_instance, index_count, first_index, vertex_offset);
+	applyMeshOverridesForDraw(commandList, true, 0, 0, index_count, first_index, vertex_offset, first_instance);
 	applyPixelConstantBufferOverridesForDraw(commandList);
 	return blockDrawCallForCommandList(commandList);
 }
@@ -2738,6 +3538,7 @@ static void onReshadePresent(effect_runtime* runtime)
 	// Numpad 7: previous compute shader
 	// Numpad 8: next compute shader
 	// Numpad 9: mark current compute shader as part of the toggle group
+	// Numpad - / -: export mesh draws and textures bound to the current vertex shader
 	const bool ctrlDown = runtime->is_key_down(VK_CONTROL);
 
 	handleHuntKey(runtime, VK_NUMPAD1, 0, [&]{ g_pixelShaderManager.huntPreviousShader(ctrlDown); });
@@ -2766,7 +3567,7 @@ static void onReshadePresent(effect_runtime* runtime)
 		else
 		{
 			// Plain Numpad 0: export
-			g_exportResultLines = exportTextures(runtime, g_pixelShaderManager.getActiveHuntedShaderHash());
+			g_exportResultLines = exportTextures(runtime, g_pixelShaderManager.getActiveHuntedShaderHash(), g_lastHuntedPixelSRVs, "ps");
 			g_showExportResult  = true;
 		}
 	}
@@ -2777,7 +3578,22 @@ static void onReshadePresent(effect_runtime* runtime)
 	    && g_activeCollectorFrameCounter == 0
 	    && g_pixelShaderManager.getActiveHuntedShaderHash() != 0)
 	{
-		g_exportResultLines = exportMeshes(runtime, g_pixelShaderManager.getActiveHuntedShaderHash());
+		if (ctrlDown && !findNewestMeshObjForShader(g_pixelShaderManager.getActiveHuntedShaderHash()).empty())
+			g_exportResultLines = importMeshOverrides(runtime, g_pixelShaderManager.getActiveHuntedShaderHash());
+		else
+			g_exportResultLines = exportMeshes(runtime, g_pixelShaderManager.getActiveHuntedShaderHash(), false);
+		g_showExportResult = true;
+	}
+
+	// Numpad - or -: export mesh draws and textures using the current hunted vertex shader.
+	if ((runtime->is_key_pressed(VK_SUBTRACT) || runtime->is_key_pressed(VK_OEM_MINUS))
+	    && g_vertexShaderManager.isInHuntingMode()
+	    && g_activeCollectorFrameCounter == 0
+	    && g_vertexShaderManager.getActiveHuntedShaderHash() != 0)
+	{
+		g_exportResultLines = exportMeshes(runtime, g_vertexShaderManager.getActiveHuntedShaderHash(), true);
+		std::vector<std::string> textureResults = exportTextures(runtime, g_vertexShaderManager.getActiveHuntedShaderHash(), g_lastHuntedVertexSRVs, "vs");
+		g_exportResultLines.insert(g_exportResultLines.end(), textureResults.begin(), textureResults.end());
 		g_showExportResult = true;
 	}
 
@@ -2792,6 +3608,7 @@ static void onReshadePresent(effect_runtime* runtime)
 
 	// Clear after export check so next frame starts fresh
 	g_lastHuntedPixelSRVs.clear();
+	g_lastHuntedVertexSRVs.clear();
 	g_lastHuntedMeshDraws.clear();
 	for (ConstantBufferSnapshot& snap : g_lastHuntedPixelCBs)
 		snap = {};
@@ -2914,6 +3731,8 @@ static void displaySettings(reshade::api::effect_runtime* runtime)
 		ImGui::TextUnformatted("* Numpad 0: export textures bound to the current pixel shader as PNG files (filename includes content hash)");
 		ImGui::TextUnformatted("* Ctrl+Numpad 0: scan the addon folder for override PNGs and inject them (replace matching textures in-game)");
 		ImGui::TextUnformatted("* Numpad .: export mesh draws bound to the current pixel shader as OBJ");
+		ImGui::TextUnformatted("* Ctrl+Numpad .: import edited OBJ positions for the current pixel shader");
+		ImGui::TextUnformatted("* Numpad - or -: export mesh draws and textures bound to the current vertex shader");
 		ImGui::TextUnformatted("* Numpad +: open editable constant-buffer variables for the current pixel shader");
 		ImGui::TextUnformatted("\nWhen you step through the shaders, the current shader is disabled in the 3D scene so you can see if that's the shader you were looking for.");
 		ImGui::TextUnformatted("When you're done, make sure you click 'Save all toggle groups' to preserve the groups you defined so next time you start your game they're loaded in and you can use them right away.");
@@ -3160,6 +3979,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 		}
 		break;
 	case DLL_PROCESS_DETACH:
+		destroyMeshVertexOverrides(g_device);
 		g_keepPixelShaderVariableOverrides = false;
 		destroyPixelConstantBufferOverrides(g_device);
 		reshade::unregister_event<reshade::addon_event::reshade_present>(onReshadePresent);
