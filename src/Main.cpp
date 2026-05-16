@@ -3708,6 +3708,13 @@ static void showHelpMarker(const char* desc)
 
 static void displaySettings(reshade::api::effect_runtime* runtime)
 {
+	static bool loggedDisplaySettings = false;
+	if(!loggedDisplaySettings)
+	{
+		reshade::log_message(3, "Shortcake diagnostic: displaySettings callback called.");
+		loggedDisplaySettings = true;
+	}
+
 	if(g_toggleGroupIdKeyBindingEditing >= 0)
 	{
 		// a keybinding is being edited. Read current pressed keys into the collector, cumulatively;
@@ -3948,34 +3955,41 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 				return FALSE;
 			}
 
-			// We'll pass a nullptr for the module handle so we get the containing process' executable + path. We can't use the reshade's api as we don't have the runtime
-			// and we can't use reshade's handle because under vulkan reshade is stored in a central space and therefore it won't get the folder of the exe (where the reshade dll is located as well).
-			WCHAR buf[MAX_PATH];
-			const std::filesystem::path dllPath = GetModuleFileNameW(nullptr, buf, ARRAYSIZE(buf)) ? buf : std::filesystem::path();		// <installpath>/shadertoggler.addon64
-			const std::filesystem::path basePath = dllPath.parent_path();																// <installpath>
-			const std::string& hashFileName = HASH_FILE_NAME;
-			g_iniFileName = (basePath / hashFileName).string();																			// <installpath>/shadertoggler.ini
-			reshade::register_event<reshade::addon_event::init_pipeline>(onInitPipeline);
-			reshade::register_event<reshade::addon_event::init_command_list>(onInitCommandList);
-			reshade::register_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
-			reshade::register_event<reshade::addon_event::reset_command_list>(onResetCommandList);
-			reshade::register_event<reshade::addon_event::destroy_pipeline>(onDestroyPipeline);
-			reshade::register_event<reshade::addon_event::reshade_overlay>(onReshadeOverlay);
-			reshade::register_event<reshade::addon_event::reshade_present>(onReshadePresent);
-			reshade::register_event<reshade::addon_event::bind_pipeline>(onBindPipeline);
-			reshade::register_event<reshade::addon_event::draw>(onDraw);
-			reshade::register_event<reshade::addon_event::draw_indexed>(onDrawIndexed);
-			reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(onDrawOrDispatchIndirect);
-			reshade::register_event<reshade::addon_event::bind_index_buffer>(onBindIndexBuffer);
-			reshade::register_event<reshade::addon_event::bind_vertex_buffers>(onBindVertexBuffers);
-			reshade::register_event<reshade::addon_event::push_descriptors>(onPushDescriptors);
-			reshade::register_event<reshade::addon_event::init_resource>(onInitResource);
-			reshade::register_event<reshade::addon_event::destroy_resource>(onDestroyResource);
-			reshade::register_event<reshade::addon_event::update_buffer_region>(onUpdateBufferRegion);
-			reshade::register_event<reshade::addon_event::map_buffer_region>(onMapBufferRegion);
-			reshade::register_event<reshade::addon_event::unmap_buffer_region>(onUnmapBufferRegion);
-			reshade::register_overlay(nullptr, &displaySettings);
-			loadShortcakeIniFile();
+			try
+			{
+				g_iniFileName = HASH_FILE_NAME;
+				reshade::register_event<reshade::addon_event::init_pipeline>(onInitPipeline);
+				reshade::register_event<reshade::addon_event::init_command_list>(onInitCommandList);
+				reshade::register_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
+				reshade::register_event<reshade::addon_event::reset_command_list>(onResetCommandList);
+				reshade::register_event<reshade::addon_event::destroy_pipeline>(onDestroyPipeline);
+				reshade::register_event<reshade::addon_event::reshade_overlay>(onReshadeOverlay);
+				reshade::register_event<reshade::addon_event::reshade_present>(onReshadePresent);
+				reshade::register_event<reshade::addon_event::bind_pipeline>(onBindPipeline);
+				reshade::register_event<reshade::addon_event::draw>(onDraw);
+				reshade::register_event<reshade::addon_event::draw_indexed>(onDrawIndexed);
+				reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(onDrawOrDispatchIndirect);
+				reshade::register_event<reshade::addon_event::bind_index_buffer>(onBindIndexBuffer);
+				reshade::register_event<reshade::addon_event::bind_vertex_buffers>(onBindVertexBuffers);
+				reshade::register_event<reshade::addon_event::push_descriptors>(onPushDescriptors);
+				reshade::register_event<reshade::addon_event::init_resource>(onInitResource);
+				reshade::register_event<reshade::addon_event::destroy_resource>(onDestroyResource);
+				reshade::register_event<reshade::addon_event::update_buffer_region>(onUpdateBufferRegion);
+				reshade::register_event<reshade::addon_event::map_buffer_region>(onMapBufferRegion);
+				reshade::register_event<reshade::addon_event::unmap_buffer_region>(onUnmapBufferRegion);
+				reshade::register_overlay(nullptr, &displaySettings);
+				loadShortcakeIniFile();
+			}
+			catch (const std::exception &e)
+			{
+				reshade::log_message(1, e.what());
+				return FALSE;
+			}
+			catch (...)
+			{
+				reshade::log_message(1, "Shortcake diagnostic: unknown exception during DLL_PROCESS_ATTACH.");
+				return FALSE;
+			}
 		}
 		break;
 	case DLL_PROCESS_DETACH:

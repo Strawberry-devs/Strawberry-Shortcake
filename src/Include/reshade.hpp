@@ -139,20 +139,30 @@ namespace reshade
 
 		const HMODULE reshade_module = internal::get_reshade_module_handle();
 		if (reshade_module == nullptr)
+		{
 			return false;
+		}
 
 		// Check that the ReShade module supports the used API
 		const auto func = reinterpret_cast<bool(*)(HMODULE, uint32_t)>(
 			GetProcAddress(reshade_module, "ReShadeRegisterAddon"));
 		if (!func(module, RESHADE_API_VERSION))
+		{
 			return false;
+		}
 
 #if defined(IMGUI_VERSION_NUM)
 		// Check that the ReShade module was built with Dear ImGui support and supports the used version
 		const auto imgui_func = reinterpret_cast<const imgui_function_table *(*)(uint32_t)>(
 			GetProcAddress(reshade_module, "ReShadeGetImGuiFunctionTable"));
-		if (imgui_func == nullptr || !(imgui_function_table_instance() = imgui_func(IMGUI_VERSION_NUM)))
+		if (imgui_func == nullptr)
+		{
 			return false;
+		}
+		if (!(imgui_function_table_instance() = imgui_func(IMGUI_VERSION_NUM)))
+		{
+			return false;
+		}
 #endif
 
 		return true;
@@ -204,6 +214,14 @@ namespace reshade
 	/// <param name="callback">Pointer to the callback function.</param>
 	inline void register_overlay(const char *title, void(*callback)(reshade::api::effect_runtime *runtime))
 	{
+		const auto func_for_addon = reinterpret_cast<void(*)(HMODULE, const char *, void(*)(reshade::api::effect_runtime *))>(
+			GetProcAddress(internal::get_reshade_module_handle(), "ReShadeRegisterOverlayForAddon"));
+		if (func_for_addon != nullptr)
+		{
+			func_for_addon(internal::get_current_module_handle(), title, callback);
+			return;
+		}
+
 		static const auto func = reinterpret_cast<void(*)(const char *, void(*)(reshade::api::effect_runtime *))>(
 			GetProcAddress(internal::get_reshade_module_handle(), "ReShadeRegisterOverlay"));
 		func(title, callback);
@@ -215,6 +233,14 @@ namespace reshade
 	/// <param name="callback">Pointer to the callback function.</param>
 	inline void unregister_overlay(const char *title, void(*callback)(reshade::api::effect_runtime *runtime))
 	{
+		const auto func_for_addon = reinterpret_cast<void(*)(HMODULE, const char *, void(*)(reshade::api::effect_runtime *))>(
+			GetProcAddress(internal::get_reshade_module_handle(), "ReShadeUnregisterOverlayForAddon"));
+		if (func_for_addon != nullptr)
+		{
+			func_for_addon(internal::get_current_module_handle(), title, callback);
+			return;
+		}
+
 		static const auto func = reinterpret_cast<void(*)(const char *, void(*)(reshade::api::effect_runtime *))>(
 			GetProcAddress(internal::get_reshade_module_handle(), "ReShadeUnregisterOverlay"));
 		func(title, callback);
