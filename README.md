@@ -1,14 +1,10 @@
 # Strawberry Shortcake
 
-Custom reimplementation of Shortcake adapted for Where Winds Meet initially but should work elsewhere. (ArcheAge works for example)
+ReShade addon that can extract textures, meshes and shaders. As well as re-inject textures and meshes; on top of being able to change shader settings.
 
 All uses of this tool are purely cosmetic. It has no use in combat or lifeskilling.
 
-# Shortcake
-Reshade 5.1+ addin to toggle game shaders on/off in groups based on a key press. It allows you to configure these groups from within the addin as well. 
-Also allows texture export (NUM0) and re-import (CTRL+NUM0)
-
-Supports 32 and 64 bit
+This software is intended for use in projects where you own the assets.
 
 ## How to use
 Place the `Shortcake.addon64` in the same folder as where the game exe is located. 
